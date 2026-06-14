@@ -38,6 +38,14 @@ unsigned short dcload_syscall_port = 31313; // Legacy mode default port, gets ov
 unsigned int syscall_retval = 0;
 unsigned char* syscall_data; // Used by cmd_retval and gdbpacket syscall
 
+/* Console-write resilience: a normal console write() blocks in bb->loop() until
+ * the host dc-tool ACKs. If the host is killed (Ctrl+C) the game hangs forever on
+ * its next printf. Once a write times out we latch this and every later write
+ * short-circuits to a no-op, so the game keeps running silently instead of
+ * freezing. Reboot (-r) re-attaches the console and clears it. */
+static int console_dead = 0;
+#define CONSOLE_WRITE_TIMEOUT_SECS 5 // host ACK is sub-ms on a LAN; only a dead host hits this
+
 static struct dirent our_dir; // Here's a global array
 
 /* send command, enable bb, bb_loop(), then return */
@@ -108,6 +116,10 @@ int read(int fd, void *buf, size_t count)
 // Send a buffer to dc-tool
 int write(int fd, const void *buf, size_t count)
 {
+	/* Host already declared gone: pretend the write succeeded, touch no network. */
+	if(console_dead)
+		return count;
+
 	command_3int_t * command = (command_3int_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
 
 	// Version is encoded as (major << 16) | (minor << 8) | patch
@@ -125,7 +137,18 @@ int write(int fd, const void *buf, size_t count)
 	command->value1 = htonl((unsigned int)buf);
 	command->value2 = htonl(count);
 	build_send_packet(sizeof(command_3int_t));
+
+	/* Bound the wait for the host ACK. cmd_retval sets escape_loop on a normal
+	 * reply (leaving timeout_loop > 0); a real timeout sets timeout_loop = -1.
+	 * If the host went away, latch console_dead so we never block again. */
+	timeout_loop = CONSOLE_WRITE_TIMEOUT_SECS;
 	bb->loop(0);
+	if(timeout_loop < 0)
+	{
+		console_dead = 1;
+		return count;
+	}
+	timeout_loop = 0;
 
 	return syscall_retval;
 }

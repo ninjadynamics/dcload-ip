@@ -1583,6 +1583,17 @@ int main(int argc, char *argv[])
 	break;
     case 'r':
 	printf("Resetting...\n");
+	{
+	    /* The reset-only path skips the upload/download data flow, which is
+	       what normally runs prepare_comms() — the version handshake that
+	       assigns global_socket and discovers dcload's negotiated v2 port.
+	       Without it, send_command() sends on socket 0 (WSAENOTSOCK on
+	       Windows). Run the handshake here so standalone `-r` works, including
+	       against a running KOS game: its dcload console/file syscalls service
+	       the inbound RBOT via bb->loop(). */
+	    unsigned char comms_buffer[2048];
+	    prepare_comms(comms_buffer);
+	}
 	if(send_command(CMD_REBOOT, 0, 0, NULL, 0) == -1)
 	    goto doclean;
 	break;

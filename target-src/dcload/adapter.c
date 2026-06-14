@@ -5,6 +5,11 @@
 // Loop escape flag, used by all drivers.
 volatile unsigned char escape_loop = 0;
 int timeout_loop = 0;
+
+/* When set, bb->loop() does ONE non-blocking pass: process any pending
+ * inbound packet (e.g. a reboot command) and return, instead of waiting
+ * for a host reply. Lets a console-dead game still honor dc-tool -r. */
+volatile unsigned char loop_nonblock = 0;
 int loop_secs_elapsed = 0;
 
 // The currently configured driver.

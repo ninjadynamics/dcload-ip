@@ -914,6 +914,8 @@ void rtl_bb_loop(int is_main_loop)
 				prev_loop_elapsed = loop_secs_elapsed;
 			}
 		}
+		if(loop_nonblock)
+			break;
 	}
 	escape_loop = 0;
 }

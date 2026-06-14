@@ -116,9 +116,17 @@ int read(int fd, void *buf, size_t count)
 // Send a buffer to dc-tool
 int write(int fd, const void *buf, size_t count)
 {
-	/* Host already declared gone: pretend the write succeeded, touch no network. */
+	/* Host gone: don't send console data and don't wait for an ACK that will
+	 * never come. Still run ONE non-blocking pass of the receive loop so an
+	 * inbound reboot (dc-tool -r) is honored -- otherwise the dev loop can't
+	 * reset a running game once the console has been declared dead. */
 	if(console_dead)
+	{
+		loop_nonblock = 1;
+		bb->loop(0);
+		loop_nonblock = 0;
 		return count;
+	}
 
 	command_3int_t * command = (command_3int_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
 

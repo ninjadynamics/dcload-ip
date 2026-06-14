@@ -735,6 +735,8 @@ void la_bb_loop(int is_main_loop)
 				prev_loop_elapsed = loop_secs_elapsed;
 			}
 		}
+		if(loop_nonblock)
+			break;
 	}
 
 	DEBUG("bb_loop exited\r\n");

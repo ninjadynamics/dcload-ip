@@ -69,6 +69,15 @@ int _nl_msg_cat_cntr;
 // Really should be using ports in the range 49152-65535, so dcload v2 does.
 #define DCTOOL_DEFAULT_SYSCALL_PORT 53535
 
+// A running game's dcload only accepts NIC packets during the brief window it
+// polls inside a syscall (one per game printf), so a single fire-and-forget
+// reboot is easily missed. Send a short burst to cover several poll windows and
+// to ride out UDP loss. Total span (REBOOT_RETRIES * REBOOT_RETRY_USEC) must stay
+// well under the post-reboot NIC re-init/link-negotiation gap (~1s of deafness),
+// so a DC that reboots mid-burst can't catch a later packet and reboot-loop.
+#define REBOOT_RETRIES   8
+#define REBOOT_RETRY_USEC 10000
+
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
@@ -1594,8 +1603,20 @@ int main(int argc, char *argv[])
 	    unsigned char comms_buffer[2048];
 	    prepare_comms(comms_buffer);
 	}
-	if(send_command(CMD_REBOOT, 0, 0, NULL, 0) == -1)
-	    goto doclean;
+	/* Burst the reboot so it lands in one of the running game's poll windows
+	   even if individual packets are missed/dropped (see REBOOT_RETRIES). */
+	{
+	    int reboot_try;
+	    for(reboot_try = 0; reboot_try < REBOOT_RETRIES; reboot_try++)
+	    {
+		unsigned int reboot_start;
+		if(send_command(CMD_REBOOT, 0, 0, NULL, 0) == -1)
+		    goto doclean;
+		reboot_start = time_in_usec();
+		while((time_in_usec() - reboot_start) < REBOOT_RETRY_USEC)
+		    ;
+	    }
+	}
 	break;
     default:
 	usage();

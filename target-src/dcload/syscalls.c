@@ -158,6 +158,13 @@ int write(int fd, const void *buf, size_t count)
 	}
 	timeout_loop = 0;
 
+	/* cmd_retval just ran bb->stop() to ACK this write, leaving the NIC's accept
+	 * filter OFF until the next syscall's build_send_packet(). A dc-tool -r that
+	 * lands in that gap (between game printfs) would be dropped at the NIC and the
+	 * reset silently missed. Re-enable RX so an inbound reboot is queued and gets
+	 * serviced on the next write()'s bb->loop(). */
+	bb->start();
+
 	return syscall_retval;
 }
 

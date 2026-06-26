@@ -45,6 +45,20 @@ unsigned char* syscall_data; // Used by cmd_retval and gdbpacket syscall
  * freezing. Reboot (-r) re-attaches the console and clears it. */
 static int console_dead = 0;
 #define CONSOLE_WRITE_TIMEOUT_SECS 5 // host ACK is sub-ms on a LAN; only a dead host hits this
+// Max console bytes pushed inline in one fire-and-forget packet. Fits a single Ethernet frame:
+// 42 (ether+ip+udp) + 16 (command_3int_t) + 1440 = 1498 <= TX_PKT_BUF_SIZE (1514). Larger writes
+// (rare; files) fall back to the blocking pull+ACK path below.
+#define CONSOLE_PUSH_MAX 1440
+
+/* Self-heal the console latch. console_dead is a static that survives a soft reboot (-r jumps to
+ * the RAM loader at 0xac004000 without re-zeroing BSS), so once a host dies the console stays dead
+ * across subsequent runs until a full power-cycle. The host sends CMD_VERSION every time dc-tool
+ * (re)attaches, so clearing the latch there makes logging resume automatically on the next
+ * connect -- the stateless/UDP behavior the dev loop wants. */
+void console_revive(void)
+{
+	console_dead = 0;
+}
 
 static struct dirent our_dir; // Here's a global array
 
@@ -116,6 +130,28 @@ int read(int fd, void *buf, size_t count)
 // Send a buffer to dc-tool
 int write(int fd, const void *buf, size_t count)
 {
+	/* Console output (stdout=1 / stderr=2) is FIRE-AND-FORGET: push the bytes inline in one
+	 * packet and return WITHOUT waiting for any host ACK. The DC must never stall on logging --
+	 * a slow or absent host (e.g. a Ctrl+C'd console) costs at most a dropped log line, never a
+	 * frame. This is the UDP philosophy: console traffic is stateless, so there is no ACK to wait
+	 * on, no retransmit timeout, and no console_dead latch to get stuck on. We still run ONE
+	 * non-blocking RX pass so an inbound dc-tool -r reboot gets serviced on the next printf. */
+	if((fd == 1 || fd == 2) && DCTOOL_MAJOR >= 2 && count <= CONSOLE_PUSH_MAX)
+	{
+		command_3int_t * push = (command_3int_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
+		memcpy(push->id, CMD_WRITE_PUSH, 4);
+		push->value0 = htonl(fd);
+		push->value1 = 0; // unused for push: data is inline, not pulled from DC RAM
+		push->value2 = htonl(count);
+		memcpy((unsigned char *)push + sizeof(command_3int_t), buf, count);
+		build_send_packet(sizeof(command_3int_t) + count);
+
+		loop_nonblock = 1;
+		bb->loop(0);
+		loop_nonblock = 0;
+		return count;
+	}
+
 	/* Host gone: don't send console data and don't wait for an ACK that will
 	 * never come. Still run ONE non-blocking pass of the receive loop so an
 	 * inbound reboot (dc-tool -r) is honored -- otherwise the dev loop can't

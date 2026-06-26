@@ -218,6 +218,21 @@ int dc_write(unsigned char * buffer)
     return 0;
 }
 
+/* Fire-and-forget console write (CMD_WRITE_PUSH). The DC pushed the bytes INLINE in this
+ * packet (no SENDBIN pull) and is NOT waiting for an ACK -- it already moved on. So just write
+ * the data out; never send CMD_RETVAL. A slow terminal here can only drop/queue packets, it can
+ * never stall the DC. This is the UDP-philosophy console path; the blocking dc_write() above is
+ * kept only for files and oversize writes. */
+int dc_write_push(unsigned char * buffer)
+{
+    command_3int_t *command = (command_3int_t *)buffer;
+    int fd = ntohl(command->value0);
+    int count = ntohl(command->value2);
+    /* value1 is unused for push; the data follows the command header inline */
+    write(fd, buffer + sizeof(command_3int_t), count);
+    return 0;
+}
+
 int dc_read(unsigned char * buffer)
 {
     unsigned char *data;

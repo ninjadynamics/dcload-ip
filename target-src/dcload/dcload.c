@@ -39,7 +39,9 @@
 #include "perfctr.h"
 
 // This is stock dcload now, no more need to explicitly mention "with DHCP"
-#define NAME "dcload-ip " DCLOAD_VERSION
+// "P5" marks our fork's loader (fire-and-forget console push); on-screen confirmation
+// that the patched boot CD actually booted.
+#define NAME "dcload-ip " DCLOAD_VERSION " - P5"
 
 // Scale up the onscreen refresh interval
 #define ONSCREEN_REFRESH_SCALED ((unsigned long long int)ONSCREEN_DHCP_LEASE_TIME_REFRESH_INTERVAL * (unsigned long long int)PERFCOUNTER_SCALE)

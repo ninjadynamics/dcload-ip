@@ -26,6 +26,7 @@ void set_mappath(char *path);
 
 int dc_fstat(unsigned char *buffer);
 int dc_write(unsigned char * buffer);
+int dc_write_push(unsigned char * buffer);
 int dc_read(unsigned char * buffer);
 int dc_open(unsigned char * buffer);
 int dc_close(unsigned char * buffer);
@@ -71,6 +72,7 @@ int dc_gdbpacket(unsigned char * buffer);
 #define CMD_CDFSREAD "DC19"
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
+#define CMD_WRITE_PUSH "DC22" // fire-and-forget console write: data inline, no SENDBIN pull, no CMD_RETVAL ACK
 
 // Special definition for exception handler data
 #define CMD_EXCEPTION "EXPT"

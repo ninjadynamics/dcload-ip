@@ -45,6 +45,7 @@
 #define CMD_CDFSREAD "DC19"
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
+#define CMD_WRITE_PUSH "DC22" // fire-and-forget console write: data inline, no SENDBIN pull, no CMD_RETVAL ACK
 
 extern unsigned short dcload_syscall_port;
 
@@ -93,5 +94,6 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 // (exempting dcload-crt0.s, which uses all of the syscalls in assembly code and doesn't need prototypes in a header)
 void build_send_packet(int command_len);
 void dcexit(void);
+void console_revive(void); // clear the console_dead latch when a host (re)attaches
 
 #endif

@@ -1253,6 +1253,8 @@ int do_console(char *path, char *isofile)
 	    CatchError(dc_write(buffer));
   if (!(memcmp(buffer, CMD_WRITE, 4)))
 	    CatchError(dc_write(buffer));
+	if (!(memcmp(buffer, CMD_WRITE_PUSH, 4)))
+	    CatchError(dc_write_push(buffer));
 	if (!(memcmp(buffer, CMD_READ, 4)))
 	    CatchError(dc_read(buffer));
 	if (!(memcmp(buffer, CMD_OPEN, 4)))

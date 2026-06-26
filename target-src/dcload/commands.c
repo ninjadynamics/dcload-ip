@@ -49,6 +49,7 @@ void cmd_reboot(void)
 {
 	booted = 0;
 	running = 0;
+	console_revive(); // clear the latch before jumping to the RAM loader (BSS isn't re-zeroed)
 
 //	CacheBlockPurge((void*)0x0c004000, 1536);
 	asm volatile ("nop\n\t" : : : "memory"); // memory barrier for GCC
@@ -342,6 +343,8 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	int datalength, j;
 	unsigned char *buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
 	command_t * response = (command_t *)buffer;
+
+	console_revive(); // a host just attached -- resume console logging even after a soft reset
 
 	// Address field isn't used in the command, so dc-tool stuffs its version in here now
 	// Added in 2.0.0 for dc-load to know what version of dc-tool is being used

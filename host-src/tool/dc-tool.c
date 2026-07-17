@@ -68,6 +68,15 @@ int _nl_msg_cat_cntr;
 #define DCTOOL_LEGACY_SYSCALL_PORT 31313
 // Really should be using ports in the range 49152-65535, so dcload v2 does.
 #define DCTOOL_DEFAULT_SYSCALL_PORT 53535
+// FIXED local (host-side) ports. Without a bind, connect() picks an ephemeral
+// port, and the target memorizes it at cmd_execute (tool_port) as the ONE
+// address it sends every syscall to — console logs and CDFS reads alike — for
+// the life of the program. A later `-o` reattach on a fresh ephemeral port
+// would handshake fine (cmd_version replies to the packet's source) yet never
+// receive the game's traffic. Binding every session to the same well-known
+// local port is what makes reattach possible at all.
+#define DCTOOL_LOCAL_PORT        53534
+#define DCTOOL_LOCAL_PORT_LEGACY 53533
 
 // A running game's dcload only accepts NIC packets during the brief window it
 // polls inside a syscall (one per game printf), so a single fire-and-forget
@@ -832,6 +841,7 @@ void usage(void)
 #endif
     printf("-i <isofile>   Enable cdfs redirection using iso image <isofile>\n");
     printf("-r             Reset (only works when dcload is in control)\n");
+    printf("-o             Reattach console and fileserver to a running program (no upload, no reboot)\n");
     printf("-g             Start a GDB server\n");
     printf("-l             Force legacy 1024-byte payload size (dcload-ip v2+ only)\n");
     printf("-f             Disable FIFO delays for MUCH faster speeds (may increase packet loss)\n");
@@ -905,6 +915,28 @@ int open_sockets(char *hostname)
 
     memcpy((char *)&sin.sin_addr, host->h_addr, host->h_length);
     memcpy((char *)&sin_legacy.sin_addr, host->h_addr, host->h_length);
+
+    // Bind fixed local ports (see DCTOOL_LOCAL_PORT above): the target memorizes
+    // our source port at execute time and sends all syscall traffic there, so it
+    // must be the same port on every run for `-o` reattach to work. UDP has no
+    // TIME_WAIT, so a Ctrl-C'd instance frees the port immediately; a bind error
+    // here means another dc-tool is still running.
+    {
+	struct sockaddr_in local;
+	bzero(&local, sizeof(local));
+	local.sin_family = AF_INET;
+	local.sin_addr.s_addr = htonl(INADDR_ANY);
+	local.sin_port = htons(DCTOOL_LOCAL_PORT);
+	if (bind(dcsocket, (struct sockaddr *)&local, sizeof(local)) < 0) {
+	    log_error("bind (is another dc-tool running?)");
+	    return -1;
+	}
+	local.sin_port = htons(DCTOOL_LOCAL_PORT_LEGACY);
+	if (bind(dcsocket_legacy, (struct sockaddr *)&local, sizeof(local)) < 0) {
+	    log_error("bind legacy (is another dc-tool running?)");
+	    return -1;
+	}
+    }
 
     // Connect legacy port first so that v2.0.0+ port won't conflict
     if (connect(dcsocket_legacy, (struct sockaddr *)&sin_legacy, sizeof(sin_legacy)) < 0) {
@@ -1360,9 +1392,9 @@ int open_gdb_socket(int port)
 }
 
 #ifdef __MINGW32__
-#define AVAILABLE_OPTIONS		"x:u:d:a:s:t:i:nlqhrgf"
+#define AVAILABLE_OPTIONS		"x:u:d:a:s:t:i:nlqhrgfo"
 #else
-#define AVAILABLE_OPTIONS		"x:u:d:a:s:t:m:c:i:nlqhrgf"
+#define AVAILABLE_OPTIONS		"x:u:d:a:s:t:m:c:i:nlqhrgfo"
 #endif
 
 int main(int argc, char *argv[])
@@ -1509,6 +1541,13 @@ int main(int argc, char *argv[])
 	    }
 	    command = 'r';
 	    break;
+	case 'o':
+	    if (command) {
+		fprintf(stderr, "You can only specify one of -x, -u, -d, -r, and -o\n");
+		goto doclean;
+	    }
+	    command = 'o';
+	    break;
 	case 'g':
 	    printf("Starting a GDB server on port 2159\n");
 	    open_gdb_socket(2159);
@@ -1591,6 +1630,33 @@ int main(int argc, char *argv[])
 	printf("Download %d bytes at <0x%x> to <%s>\n", size, address, filename);
 	if(download(filename, address, size, quiet) == -1)
 	    goto doclean;
+	break;
+    case 'o':
+	printf("Reattaching console/fileserver...\n");
+	{
+	    /* Recover from a Ctrl-C'd dc-tool without touching the running game:
+	       like standalone -r, nothing before this point ran prepare_comms(),
+	       so run the handshake here to assign global_socket / the negotiated
+	       v2 port. Its CMD_VERSION doubles as the revive signal — the target's
+	       console_revive() clears console_dead on every attach, so the game's
+	       fire-and-forget log stream resumes at this address, and with -i the
+	       /cd fileserver below answers CDFS reads again. The game services the
+	       inbound CMD_VERSION through bb->loop() during its console/file
+	       syscall windows, exactly like the reset burst. No upload, no reboot:
+	       the program keeps running throughout. */
+	    unsigned char comms_buffer[2048];
+	    prepare_comms(comms_buffer);
+	}
+	/* Unwedge nudge: if the game is stuck in the loader's unbounded CDFS wait
+	   (it issued a read while no host was serving), that spin is the one
+	   consumer polling the NIC right now — a single gratuitous CMD_RETVAL
+	   completes the wait, the bogus read fails cleanly up in KOS, and the
+	   game's next retry reaches the revived fileserver. If nothing is wedged
+	   the packet is swallowed by the next syscall's non-blocking RX pass (at
+	   worst costing one failed probe retry). */
+	send_command(CMD_RETVAL, 0, 0, NULL, 0);
+	printf("Reattached, serving console%s\n", isofile ? " + cdfs redirection" : "");
+	do_console(path, isofile);
 	break;
     case 'r':
 	printf("Resetting...\n");

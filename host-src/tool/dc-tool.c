@@ -318,7 +318,7 @@ struct timeval starttime = {0}, endtime = {0};
 
 unsigned int installed_adapter = 0;
 unsigned int legacy = 0; // To know if this should use old 1024-byte sizes for packets or new 1440-sizes
-unsigned int force_legacy = 0; // To force dcload and dc-tool into legacy mode with -l flag
+unsigned int force_legacy = 0; // Force 1024-byte bulk transfers with -l
 unsigned int fast_mode = 0; // to force dc-tool to not use any delays for higher speed
 
 // How long to wait for DC to empty its RX FIFO, in microseconds
@@ -340,31 +340,26 @@ unsigned int encoded_tool_ver = 0;
 
 void make_encoded_tool_version()
 {
-  if(!force_legacy) // Force legacy forces 1024-size packets by using the legacy system
+  int i = 1, c = 0; // Indices
+  unsigned char *ver_uchar = (unsigned char *)&encoded_tool_ver;
+
+  // 1 byte per version unit
+  while(VERSION[c] != '\0')
   {
-    int i = 1, c = 0; // Indices
-    unsigned char *ver_uchar = (unsigned char *)&encoded_tool_ver;
-    unsigned short *ver_ushort = (unsigned short *)&encoded_tool_ver;
-
-    // 1 byte per version unit
-    while(VERSION[c] != '\0')
+    if(VERSION[c] == '.')
     {
-      if(VERSION[c] == '.')
-      {
-        c++;
-        i++;
-      }
-      else
-      {
-        ver_uchar[i] *= 10;
-        ver_uchar[i] += VERSION[c] - '0';
-        c++;
-      }
+      c++;
+      i++;
     }
-
-    encoded_tool_ver = ntohl(encoded_tool_ver);
+    else
+    {
+      ver_uchar[i] *= 10;
+      ver_uchar[i] += VERSION[c] - '0';
+      c++;
+    }
   }
-  // force_legacy forces the version to 0, causing dcload and dc-tool to use legacy 1024-size mode
+
+  encoded_tool_ver = ntohl(encoded_tool_ver);
 }
 
 // Both send_data() and recv_data() use this to set up communications between dc-tool and dc-load
@@ -393,7 +388,9 @@ int prepare_comms(unsigned char *buffer)
     {
       // Stuff the encoded dc-tool version into the address field
       // dcload v2.0.0 will know what to do with this; prior versions will ignore it
-      send_cmd(CMD_VERSION, encoded_tool_ver, 0, NULL, 0);
+      /* The stock protocol couples version 0 to 1024-byte payloads. After a
+         legacy-size upload we re-advertise the real version before execute. */
+      send_cmd(CMD_VERSION, force_legacy ? 0 : encoded_tool_ver, 0, NULL, 0);
     }
     while(recv_response(buffer, PACKET_TIMEOUT) == -1);
 
@@ -412,7 +409,7 @@ int prepare_comms(unsigned char *buffer)
         {
           global_socket = dcsocket;
         }
-        send_cmd(CMD_VERSION, encoded_tool_ver, 0, NULL, 0);
+        send_cmd(CMD_VERSION, force_legacy ? 0 : encoded_tool_ver, 0, NULL, 0);
       }
       while (recv_response(buffer, PACKET_TIMEOUT) == -1);
     }
@@ -486,6 +483,38 @@ int prepare_comms(unsigned char *buffer)
       // Default rx_fifo_delay and rx_fifo_delay_count are already set for legacy
     }
   }
+}
+
+/* -l is needed only while moving a large binary: version 0 is the stock
+ * protocol's signal for FIFO-safe 1024-byte chunks. Leaving the target at
+ * version 0 after upload also disables v2 fire-and-forget console writes,
+ * turning every printf back into an acknowledged syscall. Re-advertise our
+ * real version before execute/console service, then use normal v2 transfers
+ * for the occasional runtime fileserver request. This works with existing v2
+ * loader CDs; no target-side protocol extension is required. */
+static int promote_v2_after_legacy_transfer(unsigned char *buffer)
+{
+  if(!force_legacy || !legacy)
+    return 0;
+
+  do
+  {
+    send_cmd(CMD_VERSION, encoded_tool_ver, 0, NULL, 0);
+  }
+  while(recv_response(buffer, PACKET_TIMEOUT) == -1);
+
+  while(memcmp(((command_t *)buffer)->id, CMD_VERSION, 4))
+  {
+    do
+    {
+      send_cmd(CMD_VERSION, encoded_tool_ver, 0, NULL, 0);
+    }
+    while(recv_response(buffer, PACKET_TIMEOUT) == -1);
+  }
+
+  legacy = 0;
+  printf("Restored dcload-ip v2 protocol features after 1024-byte transfer.\n");
+  return 0;
 }
 
 /* receive total bytes from dc and store in data */
@@ -843,7 +872,7 @@ void usage(void)
     printf("-r             Reset (only works when dcload is in control)\n");
     printf("-o             Reattach console and fileserver to a running program (no upload, no reboot)\n");
     printf("-g             Start a GDB server\n");
-    printf("-l             Force legacy 1024-byte payload size (dcload-ip v2+ only)\n");
+    printf("-l             Force 1024-byte bulk-transfer payloads (dcload-ip v2+ only)\n");
     printf("-f             Disable FIFO delays for MUCH faster speeds (may increase packet loss)\n");
     printf("-h             Usage information (you\'re looking at it)\n\n");
 }
@@ -1602,6 +1631,12 @@ int main(int argc, char *argv[])
 	if (address == -1)
 	    goto doclean;
 
+	{
+	    unsigned char comms_buffer[2048];
+	    if(promote_v2_after_legacy_transfer(comms_buffer) == -1)
+	        goto doclean;
+	}
+
   if(!legacy || force_legacy) // force_legacy is only valid for dcload-ip v2+
   {
     // Supposed to use the uncached area for this kind of thing, which dcload v2.0.0+ does
@@ -1646,6 +1681,8 @@ int main(int argc, char *argv[])
 	       the program keeps running throughout. */
 	    unsigned char comms_buffer[2048];
 	    prepare_comms(comms_buffer);
+	    if(promote_v2_after_legacy_transfer(comms_buffer) == -1)
+	        goto doclean;
 	}
 	/* Unwedge nudge: if the game is stuck in the loader's unbounded CDFS wait
 	   (it issued a read while no host was serving), that spin is the one

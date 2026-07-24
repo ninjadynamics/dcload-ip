@@ -309,6 +309,8 @@ unsigned int time_in_usec()
 
 /* 250000 = 0.25 seconds */
 #define PACKET_TIMEOUT 250000
+
+static int recv_matching(unsigned char *buffer, char *command, int timeout);
 struct timeval starttime = {0}, endtime = {0};
 
 // Adapter type detection
@@ -743,14 +745,7 @@ int send_data(unsigned char * addr, unsigned int dcaddr, unsigned int size)
     {
 	send_cmd(CMD_LOADBIN, dcaddr, size, NULL, 0);
     }
-    while(recv_response(buffer, PACKET_TIMEOUT) == -1);
-
-    while(memcmp(((command_t *)buffer)->id, CMD_LOADBIN, 4)) {
-	printf("send_data: error in response to CMD_LOADBIN, retrying... %c%c%c%c\n",buffer[0],buffer[1],buffer[2],buffer[3]);
-	do
-	    send_cmd(CMD_LOADBIN, dcaddr, size, NULL, 0);
-	while (recv_response(buffer, PACKET_TIMEOUT) == -1);
-    }
+    while(recv_matching(buffer, CMD_LOADBIN, PACKET_TIMEOUT) == -1);
 
     // Start throughput timer
     gettimeofday(&starttime, 0);
@@ -814,22 +809,19 @@ int send_data(unsigned char * addr, unsigned int dcaddr, unsigned int size)
     // Finish up sending and check for dropped packets (if not in fast mode)
     if(!fast_mode)
     {
+      /* delay a bit to try to make sure all data goes out before CMD_DONEBIN.
+       * The classic flat 25ms is fine once per ELF section but brutal on the
+       * runtime /cd fileserver (hundreds of small CDFS reads per stage load).
+       * The rx-fifo pacing above already drains all but the final sub-burst,
+       * so small transfers only need ~1ms; keep 25ms for bulk uploads. */
+      unsigned int drain = (size > 65536) ? PACKET_TIMEOUT/10 : 1000;
       start = time_in_usec();
-      /* delay a bit to try to make sure all data goes out before CMD_DONEBIN */
-      while ((time_in_usec() - start) < PACKET_TIMEOUT/10); // 25ms
+      while ((time_in_usec() - start) < drain);
     }
 
     do
 	send_cmd(CMD_DONEBIN, 0, 0, NULL, 0);
-    while (recv_response(buffer, PACKET_TIMEOUT) == -1);
-
-    while(memcmp(((command_t *)buffer)->id, CMD_DONEBIN, 4)) {
-	printf("send_data: error in response to CMD_DONEBIN, retrying...\n");
-
-	do
-	    send_cmd(CMD_LOADBIN, dcaddr, size, NULL, 0);
-	while (recv_response(buffer, PACKET_TIMEOUT) == -1);
-    }
+    while (recv_matching(buffer, CMD_DONEBIN, PACKET_TIMEOUT) == -1);
 
     while ( ntohl(((command_t *)buffer)->size) != 0) {
 /*	printf("%d bytes at 0x%x were missing, resending\n", ntohl(((command_t *)buffer)->size),ntohl(((command_t *)buffer)->address)); */
@@ -837,15 +829,7 @@ int send_data(unsigned char * addr, unsigned int dcaddr, unsigned int size)
 
 	do
 	    send_cmd(CMD_DONEBIN, 0, 0, NULL, 0);
-	while (recv_response(buffer, PACKET_TIMEOUT) == -1);
-
-	while(memcmp(((command_t *)buffer)->id, CMD_DONEBIN, 4)) {
-	    printf("send_data: error in response to CMD_DONEBIN, retrying...\n");
-
-	    do
-		send_cmd(CMD_LOADBIN, dcaddr, size, NULL, 0);
-	    while (recv_response(buffer, PACKET_TIMEOUT) == -1);
-	}
+	while (recv_matching(buffer, CMD_DONEBIN, PACKET_TIMEOUT) == -1);
     }
 
     gettimeofday(&endtime, 0);
@@ -1021,6 +1005,35 @@ int recv_response(unsigned char *buffer, int timeout)
     }
 
     return rv;
+}
+
+/* Wait for the response whose id matches `command`, draining anything else.
+ * Stale packets are real on this link: a command retransmitted after a lost
+ * reply gets answered twice, and the duplicate reply then arrives at the NEXT
+ * handshake. The stock code treated any mismatch as a protocol error and
+ * re-sent CMD_LOADBIN — with an already-advanced dcaddr in the DONEBIN case —
+ * desyncing the target into an unrecoverable retry loop while the DC spins in
+ * its IRQ-masked CDFS wait (machine freeze, physical reset required). A game
+ * console push caught here is printed instead of lost. Returns 0 on match,
+ * -1 on timeout (caller resends its command and retries). */
+static int recv_matching(unsigned char *buffer, char *command, int timeout)
+{
+    unsigned int start = time_in_usec();
+    unsigned int elapsed = 0;
+
+    do
+    {
+        if(recv_response(buffer, timeout - elapsed) == -1)
+            return -1;
+        if(!memcmp(((command_t *)buffer)->id, command, 4))
+            return 0;
+        if(!memcmp(((command_t *)buffer)->id, CMD_WRITE_PUSH, 4))
+            dc_write_push(buffer);
+        elapsed = time_in_usec() - start;
+    }
+    while(elapsed < (unsigned int)timeout);
+
+    return -1;
 }
 
 int send_command(char *command, unsigned int addr, unsigned int size, unsigned char *data, unsigned int dsize)

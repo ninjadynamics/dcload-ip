@@ -87,6 +87,72 @@ int _nl_msg_cat_cntr;
 #define REBOOT_RETRIES   8
 #define REBOOT_RETRY_USEC 10000
 
+unsigned int time_in_usec(void);
+
+/* KOS prints this immediately before its first redirected ISO9660 transaction.
+ * If that request datagram disappears, the P6 target waits forever with IRQs
+ * masked and dc-tool has no request to answer.  Arm a narrowly-scoped host
+ * watchdog from the console signature and automate the same RETV nudge used by
+ * `dc-tool -o`; the first CDFS request or any later console output proves that
+ * initialization progressed and disarms it. */
+#define CDFS_AUTO_RETRY_USEC 3000000U
+static const unsigned char cdfs_change_marker[] =
+    "fs_iso9660: disc change detected";
+static unsigned int cdfs_auto_retry_started = 0;
+static unsigned int cdfs_marker_matched = 0;
+static int cdfs_auto_retry_armed = 0;
+
+static int cdfs_marker_feed(const unsigned char *data, unsigned int size)
+{
+    unsigned int i;
+
+    for(i = 0; i < size; i++)
+    {
+        if(data[i] == cdfs_change_marker[cdfs_marker_matched])
+        {
+            cdfs_marker_matched++;
+            if(cdfs_marker_matched == sizeof(cdfs_change_marker) - 1)
+            {
+                cdfs_marker_matched = 0;
+                return 1;
+            }
+        }
+        else
+        {
+            cdfs_marker_matched =
+                (data[i] == cdfs_change_marker[0]) ? 1U : 0U;
+        }
+    }
+
+    return 0;
+}
+
+static int cdfs_console_has_progress(const unsigned char *data,
+                                     unsigned int size)
+{
+    unsigned int i;
+
+    /* Some stdio paths may emit the line ending separately from the text.
+     * That is still the marker write, not proof that ISO initialization moved
+     * on to another log statement. */
+    for(i = 0; i < size; i++)
+        if(data[i] != '\r' && data[i] != '\n')
+            return 1;
+
+    return 0;
+}
+
+static void cdfs_auto_retry_arm(void)
+{
+    cdfs_auto_retry_started = time_in_usec();
+    cdfs_auto_retry_armed = 1;
+}
+
+static void cdfs_auto_retry_disarm(void)
+{
+    cdfs_auto_retry_armed = 0;
+}
+
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
@@ -298,7 +364,7 @@ void cleanup(char **fnames)
 #endif
 }
 
-unsigned int time_in_usec()
+unsigned int time_in_usec(void)
 {
     struct timeval thetime;
 
@@ -1292,6 +1358,7 @@ int execute(unsigned int address, unsigned int console, unsigned int cdfsredir)
 int do_console(char *path, char *isofile)
 {
     int isofd = 0;
+    int packet_size;
     unsigned char buffer[2048];
 	struct timespec time = {0},  remain = {0};
 
@@ -1311,13 +1378,24 @@ int do_console(char *path, char *isofile)
     while (1) {
 	fflush(stdout);
 
-	while(recv_response(buffer, PACKET_TIMEOUT) == -1)
+	while((packet_size = recv_response(buffer, PACKET_TIMEOUT)) == -1) {
+	    if(cdfs_auto_retry_armed &&
+	       (time_in_usec() - cdfs_auto_retry_started) >= CDFS_AUTO_RETRY_USEC) {
+		/* This is deliberately the same one-shot recovery P6's manual
+		 * `dc-tool -o` uses.  It is only armed by KOS's exact disc-change
+		 * line, so a quiet game can never receive a stray RETV. */
+		printf("dcload: CDFS silent for 3 seconds; sending auto-retry nudge\n");
+		if(send_command(CMD_RETVAL, 0, 0, NULL, 0) == -1)
+		    return -1;
+		cdfs_auto_retry_disarm();
+	    }
 #if (SAVE_MY_FANS != 0)
         if(!fast_mode)
 		  nanosleep(&time, &remain); /* Sleep for 0ns, which is just going to yield the thread. */
 #else
 		; /* Spin thread until a packet arrives. */
 #endif
+	}
 
 	if (!(memcmp(buffer, CMD_EXIT, 4)))
 	    return -1;
@@ -1327,8 +1405,22 @@ int do_console(char *path, char *isofile)
 	    CatchError(dc_write(buffer));
   if (!(memcmp(buffer, CMD_WRITE, 4)))
 	    CatchError(dc_write(buffer));
-	if (!(memcmp(buffer, CMD_WRITE_PUSH, 4)))
+	if (!(memcmp(buffer, CMD_WRITE_PUSH, 4))) {
+	    command_3int_t *push = (command_3int_t *)buffer;
+	    unsigned int count = ntohl(push->value2);
+	    unsigned int available = packet_size > (int)sizeof(command_3int_t) ?
+		(unsigned int)packet_size - sizeof(command_3int_t) : 0;
+
+	    if(count > available)
+		count = available;
+	    if(cdfs_marker_feed(buffer + sizeof(command_3int_t), count))
+		cdfs_auto_retry_arm();
+	    else if(cdfs_auto_retry_armed &&
+		    cdfs_console_has_progress(buffer + sizeof(command_3int_t), count))
+		cdfs_auto_retry_disarm();
+
 	    CatchError(dc_write_push(buffer));
+	}
 	if (!(memcmp(buffer, CMD_READ, 4)))
 	    CatchError(dc_read(buffer));
 	if (!(memcmp(buffer, CMD_OPEN, 4)))
@@ -1361,8 +1453,13 @@ int do_console(char *path, char *isofile)
 	    CatchError(dc_closedir(buffer));
 	if (!(memcmp(buffer, CMD_READDIR, 4)))
 	    CatchError(dc_readdir(buffer));
-	if (!(memcmp(buffer, CMD_CDFSREAD, 4)))
+	if (!(memcmp(buffer, CMD_CDFSREAD, 4))) {
+	    /* A received request proves the disc-change-to-first-read gap was not
+	       the lost-request wedge. Disarm before the synchronous bulk send: an
+	       idle timer must never inject RETV into a legitimate later syscall. */
+	    cdfs_auto_retry_disarm();
 	    CatchError(dc_cdfs_redir_read_sectors(isofd, buffer));
+	}
 	if (!(memcmp(buffer, CMD_GDBPACKET, 4)))
 	    CatchError(dc_gdbpacket(buffer));
     }

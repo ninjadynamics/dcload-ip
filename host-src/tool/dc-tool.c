@@ -87,8 +87,6 @@ int _nl_msg_cat_cntr;
 #define REBOOT_RETRIES   8
 #define REBOOT_RETRY_USEC 10000
 
-unsigned int time_in_usec(void);
-
 /* KOS prints this immediately before its first redirected ISO9660 transaction.
  * If that request datagram disappears, the P6 target waits forever with IRQs
  * masked and dc-tool has no request to answer.  Arm a narrowly-scoped host
@@ -377,6 +375,8 @@ unsigned int time_in_usec(void)
 #define PACKET_TIMEOUT 250000
 
 static int recv_matching(unsigned char *buffer, char *command, int timeout);
+static int recv_matching_p7(unsigned char *buffer, const char *command,
+                            unsigned int txid, int minimum_size, int timeout);
 struct timeval starttime = {0}, endtime = {0};
 
 // Adapter type detection
@@ -458,7 +458,8 @@ int prepare_comms(unsigned char *buffer)
       // dcload v2.0.0 will know what to do with this; prior versions will ignore it
       /* The stock protocol couples version 0 to 1024-byte payloads. After a
          legacy-size upload we re-advertise the real version before execute. */
-      send_cmd(CMD_VERSION, force_legacy ? 0 : encoded_tool_ver, 0, NULL, 0);
+      send_cmd(CMD_VERSION, force_legacy ? 0 : encoded_tool_ver,
+               force_legacy ? 0 : DCTOOL_FEATURES, NULL, 0);
     }
     while(recv_response(buffer, PACKET_TIMEOUT) == -1);
 
@@ -477,7 +478,8 @@ int prepare_comms(unsigned char *buffer)
         {
           global_socket = dcsocket;
         }
-        send_cmd(CMD_VERSION, force_legacy ? 0 : encoded_tool_ver, 0, NULL, 0);
+        send_cmd(CMD_VERSION, force_legacy ? 0 : encoded_tool_ver,
+                 force_legacy ? 0 : DCTOOL_FEATURES, NULL, 0);
       }
       while (recv_response(buffer, PACKET_TIMEOUT) == -1);
     }
@@ -551,6 +553,8 @@ int prepare_comms(unsigned char *buffer)
       // Default rx_fifo_delay and rx_fifo_delay_count are already set for legacy
     }
   }
+
+  return 0;
 }
 
 /* -l is needed only while moving a large binary: version 0 is the stock
@@ -567,7 +571,7 @@ static int promote_v2_after_legacy_transfer(unsigned char *buffer)
 
   do
   {
-    send_cmd(CMD_VERSION, encoded_tool_ver, 0, NULL, 0);
+    send_cmd(CMD_VERSION, encoded_tool_ver, DCTOOL_FEATURES, NULL, 0);
   }
   while(recv_response(buffer, PACKET_TIMEOUT) == -1);
 
@@ -575,7 +579,7 @@ static int promote_v2_after_legacy_transfer(unsigned char *buffer)
   {
     do
     {
-      send_cmd(CMD_VERSION, encoded_tool_ver, 0, NULL, 0);
+      send_cmd(CMD_VERSION, encoded_tool_ver, DCTOOL_FEATURES, NULL, 0);
     }
     while(recv_response(buffer, PACKET_TIMEOUT) == -1);
   }
@@ -596,7 +600,8 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
   int retval;
 
   // v2.0.0: set up the socket, do version and adapter identification, set globals
-  prepare_comms(buffer);
+  if(prepare_comms(buffer) < 0)
+    return -1;
 
   // old 1024 sizes
   // This if() looks awful because some ARM chips don't have integer divide, so
@@ -628,7 +633,7 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
     {
       memset(buffer, 0, 2048);
 
-      while(((retval = recv(global_socket, (void *)buffer, 2048, 0)) == -1)&&((time_in_usec() - start) < PACKET_TIMEOUT));
+      retval = recv_response(buffer, PACKET_TIMEOUT);
 
       if (retval > 0)
       {
@@ -666,7 +671,7 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
         }
 
         start = time_in_usec();
-        while(((retval = recv(global_socket, (void *)buffer, 2048, 0)) == -1)&&((time_in_usec() - start) < PACKET_TIMEOUT));
+        retval = recv_response(buffer, PACKET_TIMEOUT);
 
         if (retval > 0)
         {
@@ -683,7 +688,7 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
           }
 
           // Get the DONEBIN
-          while(((retval = recv(global_socket, (void *)buffer, 2048, 0)) == -1)&&((time_in_usec() - start) < PACKET_TIMEOUT));
+          retval = recv_response(buffer, PACKET_TIMEOUT);
         }
 
         // Force us to go back and recheck
@@ -721,7 +726,7 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
     {
       memset(buffer, 0, 2048);
 
-      while(((retval = recv(global_socket, (void *)buffer, 2048, 0)) == -1)&&((time_in_usec() - start) < PACKET_TIMEOUT));
+      retval = recv_response(buffer, PACKET_TIMEOUT);
 
       if (retval > 0)
       {
@@ -758,7 +763,7 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
       }
 
       start = time_in_usec();
-      while(((retval = recv(global_socket, (void *)buffer, 2048, 0)) == -1)&&((time_in_usec() - start) < PACKET_TIMEOUT));
+      retval = recv_response(buffer, PACKET_TIMEOUT);
 
       if (retval > 0)
       {
@@ -775,7 +780,7 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
         }
 
         // Get the DONEBIN
-        while(((retval = recv(global_socket, (void *)buffer, 2048, 0)) == -1)&&((time_in_usec() - start) < PACKET_TIMEOUT));
+        retval = recv_response(buffer, PACKET_TIMEOUT);
       }
 
       // Force us to go back and recheck
@@ -791,20 +796,21 @@ int recv_data(void *data, unsigned int dcaddr, unsigned int total, unsigned int 
   return 0;
 }
 
-/* send size bytes to dc from addr to dcaddr*/
-int send_data(unsigned char * addr, unsigned int dcaddr, unsigned int size)
+/* Legacy executable/file bulk sender. P6 depends on its historical complete-
+ * or-wait semantics; transaction-bounded CDFS uses send_data_p7 below. */
+static int send_data_internal(unsigned char *addr, unsigned int dcaddr,
+                              unsigned int size)
 {
     unsigned char buffer[2048] = {0};
     unsigned char * i = 0;
     unsigned int a = dcaddr;
     unsigned int start = 0;
     unsigned int count = 0;
-
     if (!size)
 	   return -1;
 
-     // v2.0.0: Set up the socket, do version and adapter identification, set globals
-     prepare_comms(buffer);
+     if(prepare_comms(buffer) < 0)
+       return -1;
 
     // Send the data!
     do
@@ -886,20 +892,153 @@ int send_data(unsigned char * addr, unsigned int dcaddr, unsigned int size)
     }
 
     do
+    {
 	send_cmd(CMD_DONEBIN, 0, 0, NULL, 0);
+    }
     while (recv_matching(buffer, CMD_DONEBIN, PACKET_TIMEOUT) == -1);
 
     while ( ntohl(((command_t *)buffer)->size) != 0) {
+        unsigned int missing_addr = ntohl(((command_t *)buffer)->address);
+        unsigned int missing_size = ntohl(((command_t *)buffer)->size);
+        if(missing_addr < a ||
+           missing_size > size || missing_addr - a > size - missing_size)
+            return -1;
 /*	printf("%d bytes at 0x%x were missing, resending\n", ntohl(((command_t *)buffer)->size),ntohl(((command_t *)buffer)->address)); */
-	send_cmd(CMD_PARTBIN, ntohl(((command_t *)buffer)->address), ntohl(((command_t *)buffer)->size), addr + (ntohl(((command_t *)buffer)->address) - a), ntohl(((command_t *)buffer)->size));
+	send_cmd(CMD_PARTBIN, missing_addr, missing_size,
+                 addr + (missing_addr - a), missing_size);
 
 	do
+	{
 	    send_cmd(CMD_DONEBIN, 0, 0, NULL, 0);
+	}
 	while (recv_matching(buffer, CMD_DONEBIN, PACKET_TIMEOUT) == -1);
     }
 
     gettimeofday(&endtime, 0);
 
+    return 0;
+}
+
+int send_data(unsigned char *addr, unsigned int dcaddr, unsigned int size)
+{
+    return send_data_internal(addr, dcaddr, size);
+}
+
+static int send_cdfs_p7_part(unsigned int txid, unsigned int destination,
+                             const unsigned char *data, unsigned int size)
+{
+    /* command_t starts four bytes off an 8-byte boundary in the target RX
+     * buffer. Two metadata words after its 12-byte header put the actual data
+     * at +20, restoring the alignment required by SH4_aligned_memcpy. */
+    unsigned char payload[8 + 1440];
+    unsigned int value;
+
+    if(!data || size == 0 || size > 1440)
+        return -1;
+    value = htonl(size);
+    memcpy(payload, &value, sizeof(value));
+    value = 0;
+    memcpy(payload + 4, &value, sizeof(value));
+    memcpy(payload + 8, data, size);
+    return send_command(CMD_CDFSPART_P7, txid, destination,
+                        payload, size + 8);
+}
+
+int send_data_p7(unsigned char *addr, unsigned int dcaddr, unsigned int size,
+                 unsigned int txid, unsigned int timeout_usec)
+{
+    unsigned char buffer[2048] = {0};
+    unsigned char *cursor;
+    unsigned int base = dcaddr;
+    unsigned int count = 0;
+    unsigned int sent = 0;
+    unsigned int start;
+    unsigned int transfer_start = time_in_usec();
+    int packet_size;
+
+#define P7_EXPIRED() \
+    (time_in_usec() - transfer_start >= timeout_usec)
+
+    if(!addr || !size || !txid || !timeout_usec || dcaddr > 0xffffffffu - size)
+        return -1;
+
+    gettimeofday(&starttime, 0);
+    while(sent < size)
+    {
+        unsigned int chunk = size - sent;
+        cursor = addr + sent;
+        if(chunk > 1440)
+            chunk = 1440;
+        if(P7_EXPIRED() ||
+           send_cdfs_p7_part(txid, dcaddr, cursor, chunk) < 0)
+            return -1;
+        dcaddr += chunk;
+        sent += chunk;
+
+        count++;
+        if(count == rx_fifo_delay_count)
+        {
+            start = time_in_usec();
+            while((time_in_usec() - start) < rx_fifo_delay)
+                ;
+            count = 0;
+        }
+    }
+
+    if(!fast_mode)
+    {
+        unsigned int drain = (size > 65536) ? PACKET_TIMEOUT/10 : 1000;
+        start = time_in_usec();
+        while((time_in_usec() - start) < drain)
+            ;
+    }
+
+    for(;;)
+    {
+        command_3int_t *response;
+        unsigned int missing_addr;
+        unsigned int missing_size;
+        unsigned int offset;
+        unsigned int expected;
+
+        do
+        {
+            if(P7_EXPIRED() ||
+               send_command(CMD_CDFSBULKDONE_P7, txid, 0, NULL, 0) < 0)
+                return -1;
+            packet_size = recv_matching_p7(buffer, CMD_CDFSBULKDONE_P7,
+                                           txid, sizeof(command_3int_t),
+                                           PACKET_TIMEOUT);
+        }
+        while(packet_size < 0);
+
+        response = (command_3int_t *)buffer;
+        missing_addr = ntohl(response->value1);
+        missing_size = ntohl(response->value2);
+        if(missing_size == 0)
+        {
+            if(missing_addr != 0)
+                return -1;
+            break;
+        }
+        if(P7_EXPIRED() || missing_addr < base || missing_size > 1440u ||
+           missing_addr - base >= size ||
+           missing_size > size - (missing_addr - base))
+            return -1;
+        offset = missing_addr - base;
+        if((offset % 1440u) != 0)
+            return -1;
+        expected = size - offset;
+        if(expected > 1440u)
+            expected = 1440u;
+        if(missing_size != expected ||
+           send_cdfs_p7_part(txid, missing_addr, addr + offset,
+                             missing_size) < 0)
+            return -1;
+    }
+
+    gettimeofday(&endtime, 0);
+#undef P7_EXPIRED
     return 0;
 }
 
@@ -1049,28 +1188,57 @@ int open_sockets(char *hostname)
 
 int recv_response(unsigned char *buffer, int timeout)
 {
-    int start = time_in_usec();
-    int rv = -1;
-#if (SAVE_MY_FANS != 0)
-    struct timespec pausetime = {0}, pauseremain = {0};
-#endif
+    unsigned int started;
 
-    while( ((time_in_usec() - start) < timeout) && (rv == -1))
-	  {
-       rv = recv(global_socket, (void *)buffer, 2048, 0);
-       // 100Mbit/s is 10 nanoseconds, but that's reportedly a little slow.
-       // 5 is better, but still a bit slow. So let's do 1 nanosecond.
-       // There's no picosecond sleep, so this is about as good as it gets.
-#if (SAVE_MY_FANS != 0)
-       if(!fast_mode)
-       {
-         pausetime.tv_nsec = SAVE_MY_FANS; // Now it's configurable from Makefile.cfg
-         nanosleep(&pausetime, &pauseremain);
-       }
+    if(timeout <= 0)
+        return -1;
+    started = time_in_usec();
+    for(;;)
+    {
+        unsigned int elapsed = time_in_usec() - started;
+        struct timeval wait;
+        fd_set readfds;
+        int ready;
+        int rv;
+
+        if(elapsed >= (unsigned int)timeout)
+            return -1;
+        elapsed = (unsigned int)timeout - elapsed;
+        wait.tv_sec = elapsed / 1000000U;
+        wait.tv_usec = elapsed % 1000000U;
+        FD_ZERO(&readfds);
+        FD_SET(global_socket, &readfds);
+#ifdef __MINGW32__
+        ready = select(0, &readfds, NULL, NULL, &wait);
+        if(ready == SOCKET_ERROR)
+        {
+            if(WSAGetLastError() == WSAEINTR)
+                continue;
+            return -1;
+        }
+#else
+        ready = select(global_socket + 1, &readfds, NULL, NULL, &wait);
+        if(ready < 0)
+        {
+            if(errno == EINTR)
+                continue;
+            return -1;
+        }
+#endif
+        if(ready == 0)
+            return -1;
+        rv = recv(global_socket, (void *)buffer, 2048, 0);
+        if(rv >= 0)
+            return rv;
+#ifdef __MINGW32__
+        if(WSAGetLastError() != WSAEWOULDBLOCK &&
+           WSAGetLastError() != WSAEINTR)
+            return -1;
+#else
+        if(errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            return -1;
 #endif
     }
-
-    return rv;
 }
 
 /* Wait for the response whose id matches `command`, draining anything else.
@@ -1080,8 +1248,8 @@ int recv_response(unsigned char *buffer, int timeout)
  * re-sent CMD_LOADBIN — with an already-advanced dcaddr in the DONEBIN case —
  * desyncing the target into an unrecoverable retry loop while the DC spins in
  * its IRQ-masked CDFS wait (machine freeze, physical reset required). A game
- * console push caught here is printed instead of lost. Returns 0 on match,
- * -1 on timeout (caller resends its command and retries). */
+ * console push caught here is printed instead of lost. Returns the matching
+ * packet size, or -1 on timeout (caller resends its command and retries). */
 static int recv_matching(unsigned char *buffer, char *command, int timeout)
 {
     unsigned int start = time_in_usec();
@@ -1089,12 +1257,54 @@ static int recv_matching(unsigned char *buffer, char *command, int timeout)
 
     do
     {
-        if(recv_response(buffer, timeout - elapsed) == -1)
+        int packet_size = recv_response(buffer, timeout - elapsed);
+        if(packet_size == -1)
             return -1;
-        if(!memcmp(((command_t *)buffer)->id, command, 4))
-            return 0;
+        /* UDP preserves datagram boundaries, but a malformed/empty datagram
+         * must not make the dispatcher compare four stale stack bytes. */
+        if(packet_size < 4)
+        {
+            elapsed = time_in_usec() - start;
+            continue;
+        }
+        if(packet_size >= COMMAND_LEN &&
+           !memcmp(((command_t *)buffer)->id, command, 4))
+            return packet_size;
         if(!memcmp(((command_t *)buffer)->id, CMD_WRITE_PUSH, 4))
-            dc_write_push(buffer);
+            dc_write_push(buffer, packet_size);
+        elapsed = time_in_usec() - start;
+    }
+    while(elapsed < (unsigned int)timeout);
+
+    return -1;
+}
+
+/* P7 bulk replies are matched by command AND transaction. Draining an old
+ * same-ID datagram is mandatory: the four city windows reuse one target
+ * scratch address, so ID-only matching would let a delayed DONE from window N
+ * falsely complete window N+1. */
+static int recv_matching_p7(unsigned char *buffer, const char *command,
+                            unsigned int txid, int minimum_size, int timeout)
+{
+    unsigned int start = time_in_usec();
+    unsigned int elapsed = 0;
+
+    do
+    {
+        int packet_size = recv_response(buffer, timeout - elapsed);
+        if(packet_size == -1)
+            return -1;
+        if(packet_size >= minimum_size && packet_size >= COMMAND_LEN &&
+           !memcmp(((command_t *)buffer)->id, command, 4) &&
+           ntohl(((command_t *)buffer)->address) == txid)
+            return packet_size;
+        if(packet_size >= 4 &&
+           !memcmp(((command_t *)buffer)->id, CMD_WRITE_PUSH, 4))
+            dc_write_push(buffer, packet_size);
+        else if(packet_size >= 4 &&
+                !memcmp(((command_t *)buffer)->id, CMD_CDFSACK_P7, 4))
+            dc_cdfs_p7_ack(buffer, packet_size);
+        dc_cdfs_p7_poll();
         elapsed = time_in_usec() - start;
     }
     while(elapsed < (unsigned int)timeout);
@@ -1108,6 +1318,8 @@ int send_command(char *command, unsigned int addr, unsigned int size, unsigned c
     unsigned int tmp;
     int error = 0;
 
+    if(dsize > sizeof(c_buff) - COMMAND_LEN || (dsize != 0 && data == NULL))
+        return -1;
     memcpy(c_buff, command, 4);
     tmp = htonl(addr);
     memcpy(c_buff + 4, &tmp, 4);
@@ -1357,16 +1569,21 @@ int execute(unsigned int address, unsigned int console, unsigned int cdfsredir)
 
 int do_console(char *path, char *isofile)
 {
-    int isofd = 0;
+    int isofd = -1;
     int packet_size;
     unsigned char buffer[2048];
-	struct timespec time = {0},  remain = {0};
 
     if (isofile) {
 	isofd = open(isofile, O_RDONLY | O_BINARY);
 	if (isofd < 0)
 	    log_error(isofile);
     }
+
+    /* Flush the upload/execute banner once, then keep all runtime target
+     * console writes off this network-serving thread. */
+    fflush(stdout);
+    if(dc_console_sink_init() < 0)
+        fprintf(stderr, "dc-tool: async console sink unavailable; target output disabled\n");
 
 #ifndef __MINGW32__
     if (!nochroot && path){
@@ -1376,29 +1593,30 @@ int do_console(char *path, char *isofile)
 #endif
 
     while (1) {
-	fflush(stdout);
-
 	while((packet_size = recv_response(buffer, PACKET_TIMEOUT)) == -1) {
+	    dc_cdfs_p7_poll();
 	    if(cdfs_auto_retry_armed &&
 	       (time_in_usec() - cdfs_auto_retry_started) >= CDFS_AUTO_RETRY_USEC) {
 		/* This is deliberately the same one-shot recovery P6's manual
 		 * `dc-tool -o` uses.  It is only armed by KOS's exact disc-change
 		 * line, so a quiet game can never receive a stray RETV. */
-		printf("dcload: CDFS silent for 3 seconds; sending auto-retry nudge\n");
+		dc_console_sink_notice(
+		    "dcload: CDFS silent for 3 seconds; sending P6 auto-retry nudge\n");
 		if(send_command(CMD_RETVAL, 0, 0, NULL, 0) == -1)
 		    return -1;
 		cdfs_auto_retry_disarm();
 	    }
-#if (SAVE_MY_FANS != 0)
-        if(!fast_mode)
-		  nanosleep(&time, &remain); /* Sleep for 0ns, which is just going to yield the thread. */
-#else
-		; /* Spin thread until a packet arrives. */
-#endif
 	}
+	/* Continuous console traffic must not postpone a lost-ACK completion
+	 * retry; polling only on socket-idle timeouts made that accidental. */
+	dc_cdfs_p7_poll();
+	if(packet_size < 4)
+	    continue;
 
-	if (!(memcmp(buffer, CMD_EXIT, 4)))
+	if (!(memcmp(buffer, CMD_EXIT, 4))) {
+	    dc_console_sink_shutdown();
 	    return -1;
+	}
 	if (!(memcmp(buffer, CMD_FSTAT, 4)))
 	    CatchError(dc_fstat(buffer));
 	if (!(memcmp(buffer, CMD_WRITE_OLD, 4)))
@@ -1407,19 +1625,21 @@ int do_console(char *path, char *isofile)
 	    CatchError(dc_write(buffer));
 	if (!(memcmp(buffer, CMD_WRITE_PUSH, 4))) {
 	    command_3int_t *push = (command_3int_t *)buffer;
-	    unsigned int count = ntohl(push->value2);
+	    unsigned int count = 0;
 	    unsigned int available = packet_size > (int)sizeof(command_3int_t) ?
 		(unsigned int)packet_size - sizeof(command_3int_t) : 0;
 
+	    if(packet_size >= (int)sizeof(command_3int_t))
+		count = ntohl(push->value2);
 	    if(count > available)
 		count = available;
-	    if(cdfs_marker_feed(buffer + sizeof(command_3int_t), count))
+	    if(count && cdfs_marker_feed(buffer + sizeof(command_3int_t), count))
 		cdfs_auto_retry_arm();
-	    else if(cdfs_auto_retry_armed &&
+	    else if(count && cdfs_auto_retry_armed &&
 		    cdfs_console_has_progress(buffer + sizeof(command_3int_t), count))
 		cdfs_auto_retry_disarm();
 
-	    CatchError(dc_write_push(buffer));
+	    CatchError(dc_write_push(buffer, packet_size));
 	}
 	if (!(memcmp(buffer, CMD_READ, 4)))
 	    CatchError(dc_read(buffer));
@@ -1453,12 +1673,18 @@ int do_console(char *path, char *isofile)
 	    CatchError(dc_closedir(buffer));
 	if (!(memcmp(buffer, CMD_READDIR, 4)))
 	    CatchError(dc_readdir(buffer));
+	if (!(memcmp(buffer, CMD_CDFSACK_P7, 4)))
+	    dc_cdfs_p7_ack(buffer, packet_size);
+	if (!(memcmp(buffer, CMD_CDFSREAD_P7, 4))) {
+	    cdfs_auto_retry_disarm();
+	    CatchError(dc_cdfs_p7_read_sectors(isofd, buffer, packet_size));
+	}
 	if (!(memcmp(buffer, CMD_CDFSREAD, 4))) {
 	    /* A received request proves the disc-change-to-first-read gap was not
 	       the lost-request wedge. Disarm before the synchronous bulk send: an
 	       idle timer must never inject RETV into a legitimate later syscall. */
 	    cdfs_auto_retry_disarm();
-	    CatchError(dc_cdfs_redir_read_sectors(isofd, buffer));
+	    CatchError(dc_cdfs_redir_read_sectors(isofd, buffer, packet_size));
 	}
 	if (!(memcmp(buffer, CMD_GDBPACKET, 4)))
 	    CatchError(dc_gdbpacket(buffer));
@@ -1790,7 +2016,8 @@ int main(int argc, char *argv[])
 	       syscall windows, exactly like the reset burst. No upload, no reboot:
 	       the program keeps running throughout. */
 	    unsigned char comms_buffer[2048];
-	    prepare_comms(comms_buffer);
+	    if(prepare_comms(comms_buffer) < 0)
+	        goto doclean;
 	    if(promote_v2_after_legacy_transfer(comms_buffer) == -1)
 	        goto doclean;
 	}
@@ -1816,7 +2043,8 @@ int main(int argc, char *argv[])
 	       against a running KOS game: its dcload console/file syscalls service
 	       the inbound RBOT via bb->loop(). */
 	    unsigned char comms_buffer[2048];
-	    prepare_comms(comms_buffer);
+	    if(prepare_comms(comms_buffer) < 0)
+	        goto doclean;
 	}
 	/* Burst the reboot so it lands in one of the running game's poll windows
 	   even if individual packets are missed/dropped (see REBOOT_RETRIES). */

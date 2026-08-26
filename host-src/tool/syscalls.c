@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -70,6 +71,221 @@ static int mappatlen = -1;
 
 static char path_work_buffer[MAX_PATH_LEN];
 static char path_result_buffer[MAX_PATH_LEN];
+
+/* Runtime console output is explicitly lossy (CMD_WRITE_PUSH has no ACK), but
+ * it must never block the protocol thread that also serves redirected CDFS.
+ * On Windows a VS Code/tee pipe can block write() for seconds. Move that write
+ * to a bounded worker queue; when the UI cannot keep up, drop diagnostics rather
+ * than starve the Dreamcast filesystem. */
+#define CONSOLE_PUSH_MAX 1440
+#define CONSOLE_SINK_SLOTS 128
+#define CDFS_P7_MIN_TIMEOUT_USEC       6000000U
+#define CDFS_P7_BASE_TIMEOUT_USEC      2000000U
+#define CDFS_P7_PACKET_BUDGET_USEC        3000U
+#define CDFS_P7_MAX_TIMEOUT_USEC      45000000U
+
+/* A fixed six-second deadline is ample for HyperSolar's ~624 KiB city
+ * windows, but cannot cover P7's advertised 16 MiB maximum over the slower
+ * LAN adapter. Budget each 1440-byte datagram conservatively, retain the fast
+ * six-second floor for ordinary reads, and keep even the largest transaction
+ * bounded. The target uses the same packet budget plus a three-second margin. */
+static unsigned int cdfs_p7_bulk_timeout_usec(unsigned int size)
+{
+    unsigned long long packets =
+        ((unsigned long long)size + 1439ULL) / 1440ULL;
+    unsigned long long timeout = CDFS_P7_BASE_TIMEOUT_USEC +
+        packets * CDFS_P7_PACKET_BUDGET_USEC;
+
+    if(timeout < CDFS_P7_MIN_TIMEOUT_USEC)
+        timeout = CDFS_P7_MIN_TIMEOUT_USEC;
+    if(timeout > CDFS_P7_MAX_TIMEOUT_USEC)
+        timeout = CDFS_P7_MAX_TIMEOUT_USEC;
+    return (unsigned int)timeout;
+}
+
+static int cdfs_iso_range(int fd, unsigned int sector, unsigned int size,
+                          off_t *offset)
+{
+    struct stat st;
+    unsigned long long byte_offset;
+
+    if(fd < 0 || sector < 150 || size == 0 || size > 0x01000000U ||
+       fstat(fd, &st) < 0 || st.st_size < 0)
+        return -1;
+    byte_offset = (unsigned long long)(sector - 150) * 2048ULL;
+    if(byte_offset > (unsigned long long)st.st_size ||
+       (unsigned long long)size > (unsigned long long)st.st_size - byte_offset)
+        return -1;
+    *offset = (off_t)byte_offset;
+    return 0;
+}
+
+#ifdef __MINGW32__
+typedef struct {
+    int fd;
+    unsigned short size;
+    unsigned char data[CONSOLE_PUSH_MAX];
+} console_sink_slot_t;
+
+static console_sink_slot_t console_sink_queue[CONSOLE_SINK_SLOTS];
+static unsigned int console_sink_head;
+static unsigned int console_sink_tail;
+static unsigned int console_sink_dropped;
+static int console_sink_ready;
+static int console_sink_stopping;
+static CRITICAL_SECTION console_sink_lock;
+static HANDLE console_sink_sem;
+static HANDLE console_sink_thread;
+
+static void console_sink_write_all(int fd, const unsigned char *data,
+                                   unsigned int size)
+{
+    while(size > 0)
+    {
+        int n = write(fd, data, size);
+        if(n <= 0)
+            return;
+        data += n;
+        size -= (unsigned int)n;
+    }
+}
+
+static DWORD WINAPI console_sink_worker(LPVOID unused)
+{
+    (void)unused;
+    for(;;)
+    {
+        console_sink_slot_t slot;
+        unsigned int dropped = 0;
+        int have_slot = 0;
+        int stop_after_slot = 0;
+
+        if(WaitForSingleObject(console_sink_sem, INFINITE) != WAIT_OBJECT_0)
+            break;
+        EnterCriticalSection(&console_sink_lock);
+        if(console_sink_tail != console_sink_head)
+        {
+            slot = console_sink_queue[console_sink_tail % CONSOLE_SINK_SLOTS];
+            console_sink_tail++;
+            have_slot = 1;
+            if(console_sink_tail == console_sink_head && console_sink_dropped)
+            {
+                dropped = console_sink_dropped;
+                console_sink_dropped = 0;
+            }
+            stop_after_slot = console_sink_stopping &&
+                              console_sink_tail == console_sink_head;
+        }
+        else if(console_sink_stopping)
+        {
+            LeaveCriticalSection(&console_sink_lock);
+            break;
+        }
+        LeaveCriticalSection(&console_sink_lock);
+
+        if(have_slot)
+            console_sink_write_all(slot.fd, slot.data, slot.size);
+        if(dropped)
+        {
+            char warning[96];
+            int n = snprintf(warning, sizeof(warning),
+                             "dc-tool: dropped %u console packets (slow output)\n",
+                             dropped);
+            if(n > 0)
+                console_sink_write_all(2, (const unsigned char *)warning,
+                                       (unsigned int)n);
+        }
+        if(stop_after_slot)
+            break;
+    }
+    return 0;
+}
+#endif
+
+int dc_console_sink_init(void)
+{
+#ifdef __MINGW32__
+    if(console_sink_ready)
+        return 0;
+    console_sink_head = console_sink_tail = console_sink_dropped = 0;
+    console_sink_stopping = 0;
+    InitializeCriticalSection(&console_sink_lock);
+    console_sink_sem = CreateSemaphore(NULL, 0, CONSOLE_SINK_SLOTS, NULL);
+    if(!console_sink_sem)
+    {
+        DeleteCriticalSection(&console_sink_lock);
+        return -1;
+    }
+    console_sink_thread = CreateThread(NULL, 0, console_sink_worker,
+                                       NULL, 0, NULL);
+    if(!console_sink_thread)
+    {
+        CloseHandle(console_sink_sem);
+        DeleteCriticalSection(&console_sink_lock);
+        return -1;
+    }
+    console_sink_ready = 1;
+#endif
+    return 0;
+}
+
+void dc_console_sink_shutdown(void)
+{
+#ifdef __MINGW32__
+    if(!console_sink_ready)
+        return;
+    EnterCriticalSection(&console_sink_lock);
+    console_sink_stopping = 1;
+    LeaveCriticalSection(&console_sink_lock);
+    ReleaseSemaphore(console_sink_sem, 1, NULL);
+    /* A closed or wedged IDE pipe must not hold up dc-tool's own exit. */
+    if(WaitForSingleObject(console_sink_thread, 250) == WAIT_OBJECT_0)
+    {
+        CloseHandle(console_sink_thread);
+        CloseHandle(console_sink_sem);
+        DeleteCriticalSection(&console_sink_lock);
+    }
+    console_sink_ready = 0;
+#endif
+}
+
+static void dc_console_sink_write(int fd, const unsigned char *data,
+                                  unsigned int size)
+{
+#ifdef __MINGW32__
+    if(!console_sink_ready || size == 0)
+        return;
+    EnterCriticalSection(&console_sink_lock);
+    if(console_sink_head - console_sink_tail >= CONSOLE_SINK_SLOTS)
+    {
+        console_sink_dropped++;
+        LeaveCriticalSection(&console_sink_lock);
+        return;
+    }
+    console_sink_slot_t *slot =
+        &console_sink_queue[console_sink_head % CONSOLE_SINK_SLOTS];
+    slot->fd = fd;
+    slot->size = (unsigned short)size;
+    memcpy(slot->data, data, size);
+    console_sink_head++;
+    LeaveCriticalSection(&console_sink_lock);
+    ReleaseSemaphore(console_sink_sem, 1, NULL);
+#else
+    (void)write(fd, data, size);
+#endif
+}
+
+void dc_console_sink_notice(const char *message)
+{
+    unsigned int size;
+    if(!message)
+        return;
+    size = (unsigned int)strlen(message);
+    if(size > CONSOLE_PUSH_MAX)
+        size = CONSOLE_PUSH_MAX;
+    dc_console_sink_write(1, (const unsigned char *)message, size);
+}
+
 void set_mappath(char *path) {
   mappath = path;
   mappatlen = strlen(mappath);
@@ -223,13 +439,26 @@ int dc_write(unsigned char * buffer)
  * the data out; never send CMD_RETVAL. A slow terminal here can only drop/queue packets, it can
  * never stall the DC. This is the UDP-philosophy console path; the blocking dc_write() above is
  * kept only for files and oversize writes. */
-int dc_write_push(unsigned char * buffer)
+int dc_write_push(unsigned char *buffer, int packet_size)
 {
     command_3int_t *command = (command_3int_t *)buffer;
-    int fd = ntohl(command->value0);
-    int count = ntohl(command->value2);
+    int fd;
+    unsigned int count;
+    unsigned int available;
+
+    if(packet_size < (int)sizeof(command_3int_t))
+        return 0;
+    fd = (int)ntohl(command->value0);
+    if(fd != 1 && fd != 2)
+        return 0;
+    count = ntohl(command->value2);
+    available = (unsigned int)packet_size - sizeof(command_3int_t);
+    if(count > available)
+        count = available;
+    if(count > CONSOLE_PUSH_MAX)
+        count = CONSOLE_PUSH_MAX;
     /* value1 is unused for push; the data follows the command header inline */
-    write(fd, buffer + sizeof(command_3int_t), count);
+    dc_console_sink_write(fd, buffer + sizeof(command_3int_t), count);
     return 0;
 }
 
@@ -547,25 +776,176 @@ int dc_rewinddir(unsigned char * buffer)
     return 0;
 }
 
-int dc_cdfs_redir_read_sectors(int isofd, unsigned char * buffer)
+int dc_cdfs_redir_read_sectors(int isofd, unsigned char *buffer,
+                               int packet_size)
 {
-    int start;
-    unsigned char * buf;
+    int retval = -1;
+    unsigned int sector;
+    unsigned int size;
+    unsigned int done = 0;
+    off_t file_offset;
+    unsigned char *buf = NULL;
     command_3int_t *command = (command_3int_t *)buffer;
 
-    start = ntohl(command->value0) - 150;
+    if(packet_size < (int)sizeof(command_3int_t))
+        goto done;
+    sector = ntohl(command->value0);
+    size = ntohl(command->value2);
+    if(cdfs_iso_range(isofd, sector, size, &file_offset) < 0)
+        goto done;
+    if(lseek(isofd, file_offset, SEEK_SET) < 0)
+        goto done;
+    buf = malloc(size);
+    if(!buf)
+        goto done;
+    while(done < size)
+    {
+        int got = read(isofd, buf + done, size - done);
+        if(got <= 0)
+            goto done;
+        done += (unsigned int)got;
+    }
+    /* DC19 has no transaction identity, so preserve its historical complete-
+     * or-wait behavior. A P6 target ignores a failed RETV status and would
+     * otherwise consume a partially written sector buffer as success. P7 is
+     * the bounded path. */
+    if(send_data(buf, ntohl(command->value1), size) < 0)
+        goto done;
+    retval = 0;
 
-    lseek(isofd, start * 2048, SEEK_SET);
-
-    buf = malloc(ntohl(command->value2));
-
-    read(isofd, buf, ntohl(command->value2));
-
-    send_data(buf, ntohl(command->value1), ntohl(command->value2));
-
-    send_cmd(CMD_RETVAL, 0, 0, NULL, 0);
-
+done:
+    send_cmd(CMD_RETVAL, retval, retval, NULL, 0);
     free(buf);
+    return 0;
+}
+
+/* Transaction-safe P7 redirected CDFS. The host keeps exactly one completed
+ * transaction because the target is strictly synchronous: an identical retry
+ * resends only the tagged completion, never the bulk payload. */
+typedef struct {
+    unsigned int valid;
+    unsigned int txid;
+    unsigned int sector;
+    unsigned int destination;
+    unsigned int size;
+    int status;
+    unsigned int completion_pending;
+    unsigned int completion_sends;
+    unsigned int completion_sent_at;
+} cdfs_p7_cache_t;
+
+static cdfs_p7_cache_t cdfs_p7_cache;
+#define CDFS_P7_COMPLETION_RETRY_USEC 250000U
+#define CDFS_P7_COMPLETION_SENDS 4U
+
+static void cdfs_p7_send_completion(unsigned int txid, int status)
+{
+    send_command(CMD_CDFSDONE_P7, txid, (unsigned int)status, NULL, 0);
+}
+
+static void cdfs_p7_schedule_completion(void)
+{
+    cdfs_p7_send_completion(cdfs_p7_cache.txid, cdfs_p7_cache.status);
+    cdfs_p7_cache.completion_pending = 1;
+    cdfs_p7_cache.completion_sends = 1;
+    cdfs_p7_cache.completion_sent_at = time_in_usec();
+}
+
+void dc_cdfs_p7_poll(void)
+{
+    unsigned int now;
+    if(!cdfs_p7_cache.completion_pending)
+        return;
+    now = time_in_usec();
+    if(now - cdfs_p7_cache.completion_sent_at <
+       CDFS_P7_COMPLETION_RETRY_USEC)
+        return;
+    if(cdfs_p7_cache.completion_sends >= CDFS_P7_COMPLETION_SENDS)
+    {
+        cdfs_p7_cache.completion_pending = 0;
+        return;
+    }
+    cdfs_p7_send_completion(cdfs_p7_cache.txid, cdfs_p7_cache.status);
+    cdfs_p7_cache.completion_sends++;
+    cdfs_p7_cache.completion_sent_at = now;
+}
+
+void dc_cdfs_p7_ack(unsigned char *buffer, int packet_size)
+{
+    command_t *command = (command_t *)buffer;
+    if(packet_size < COMMAND_LEN || !cdfs_p7_cache.completion_pending)
+        return;
+    if(ntohl(command->address) == cdfs_p7_cache.txid &&
+       (int)ntohl(command->size) == cdfs_p7_cache.status)
+        cdfs_p7_cache.completion_pending = 0;
+}
+
+int dc_cdfs_p7_read_sectors(int isofd, unsigned char *buffer, int packet_size)
+{
+    command_4int_t *command = (command_4int_t *)buffer;
+    unsigned int txid, sector, destination, size;
+    unsigned int done = 0;
+    off_t file_offset;
+    unsigned char *data = NULL;
+    int status = 1;
+
+    if(packet_size < (int)sizeof(command_4int_t))
+        return 0;
+    txid = ntohl(command->value0);
+    sector = ntohl(command->value1);
+    destination = ntohl(command->value2);
+    size = ntohl(command->value3);
+    if(txid == 0)
+        return 0;
+
+    if(cdfs_p7_cache.valid && txid == cdfs_p7_cache.txid)
+    {
+        if(sector == cdfs_p7_cache.sector &&
+           destination == cdfs_p7_cache.destination &&
+           size == cdfs_p7_cache.size)
+            cdfs_p7_schedule_completion();
+        else
+            cdfs_p7_send_completion(txid, 2); /* txid reused with a new signature */
+        return 0;
+    }
+    if(cdfs_p7_cache.valid &&
+       (int32_t)(txid - cdfs_p7_cache.txid) < 0)
+    {
+        cdfs_p7_send_completion(txid, 3);     /* stale/reordered request */
+        return 0;
+    }
+
+    /* A newer request proves the target received the previous completion even
+     * if its ACK was lost. It is now safe to retire the pending retry. */
+    cdfs_p7_cache.completion_pending = 0;
+    if(cdfs_iso_range(isofd, sector, size, &file_offset) < 0)
+        goto finished;
+    if(lseek(isofd, file_offset, SEEK_SET) < 0)
+        goto finished;
+    data = malloc(size);
+    if(!data)
+        goto finished;
+    while(done < size)
+    {
+        int got = read(isofd, data + done, size - done);
+        if(got <= 0)
+            goto finished;
+        done += (unsigned int)got;
+    }
+    if(send_data_p7(data, destination, size, txid,
+                    cdfs_p7_bulk_timeout_usec(size)) < 0)
+        goto finished;
+    status = 0;
+
+finished:
+    free(data);
+    cdfs_p7_cache.valid = 1;
+    cdfs_p7_cache.txid = txid;
+    cdfs_p7_cache.sector = sector;
+    cdfs_p7_cache.destination = destination;
+    cdfs_p7_cache.size = size;
+    cdfs_p7_cache.status = status;
+    cdfs_p7_schedule_completion();
     return 0;
 }
 

@@ -21,6 +21,7 @@ unsigned int tool_ip = 0;
 unsigned char tool_mac[6] = {0};
 unsigned short tool_port = 0;
 unsigned int tool_version = 0;
+unsigned int tool_features = 0;
 
 static unsigned int cached_dest = 0;
 static int payload1024 = 0;
@@ -44,6 +45,63 @@ typedef struct {
 
 // Align huge map array to 8 bytes (it's already after 2x unsigned ints)
 __attribute__((aligned(8))) static bin_info_t bin_info; // Here's a global array. This one is massive, but please don't shrink it. It's meant to act as a map where each 1024B maps into 16MB RAM, and 1024B fits into a packet...
+
+/* P7 CDFS bulk packets are transaction tagged all the way through. DC23
+ * initializes this state before the request is sent; DC26/DC27 must carry the
+ * same txid. This prevents a delayed PART/DONE from an earlier read from
+ * writing into, or falsely completing, the next read's reused scratch buffer. */
+static unsigned int cdfs_p7_bulk_txid;
+static int cdfs_p7_bulk_active;
+static int cdfs_p7_bulk_complete;
+
+typedef struct __attribute__ ((packed, aligned(4))) {
+	unsigned char id[4];
+	unsigned int txid;
+	unsigned int address;
+	unsigned int size;
+	unsigned int reserved;
+	unsigned char data[];
+} cdfs_p7_part_command_t;
+
+int cmd_cdfs_p7_bulk_begin(unsigned int txid, unsigned int destination,
+			   unsigned int size)
+{
+	if(txid == 0 || destination == 0 || size == 0 || size > 16777216u ||
+	   destination > 0xffffffffu - size)
+		return 0;
+	cdfs_p7_bulk_txid = txid;
+	cdfs_p7_bulk_active = 1;
+	cdfs_p7_bulk_complete = 0;
+	bin_info.load_address = destination;
+	bin_info.load_size = size;
+	memset_zeroes_64bit(bin_info.map, BIN_INFO_MAP_SIZE/8);
+
+	/* P7 is negotiated only after the host restores the v2 protocol, so every
+	 * tagged chunk uses the 1440-byte map geometry. */
+	payload1024 = 0;
+	{
+		unsigned int cacheable_check = destination >> 29;
+		cached_dest = (cacheable_check != 0x5) &&
+			      (cacheable_check != 0x7);
+	}
+	return 1;
+}
+
+void cmd_cdfs_p7_bulk_end(unsigned int txid)
+{
+	if(cdfs_p7_bulk_txid == txid)
+	{
+		cdfs_p7_bulk_txid = 0;
+		cdfs_p7_bulk_active = 0;
+		cdfs_p7_bulk_complete = 0;
+	}
+}
+
+int cmd_cdfs_p7_bulk_ready(unsigned int txid)
+{
+	return txid != 0 && txid == cdfs_p7_bulk_txid &&
+	       !cdfs_p7_bulk_active && cdfs_p7_bulk_complete;
+}
 
 void cmd_reboot(void)
 {
@@ -102,6 +160,10 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 
 void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
+	/* A synchronous P7 CDFS read exclusively owns bin_info until its tagged
+	 * completion. Delayed legacy bulk packets must not reset that map/base. */
+	if(cdfs_p7_active())
+		return;
 	bin_info.load_address = ntohl(command->address);
 	bin_info.load_size = ntohl(command->size);
 
@@ -174,11 +236,28 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	}
 }
 
-void cmd_partbin(command_t * command)
+void cmd_partbin(command_t *command, unsigned int packet_size)
 {
-	int index = 0;
-	unsigned int cmd_addr = ntohl(command->address);
-	unsigned int cmd_size = ntohl(command->size);
+	unsigned int cmd_addr, cmd_size, payload_size, offset, expected, index;
+	if(cdfs_p7_active())
+		return;
+	cmd_addr = ntohl(command->address);
+	cmd_size = ntohl(command->size);
+	payload_size = payload1024 ? 1024u : 1440u;
+	if(packet_size < COMMAND_LEN || cmd_size == 0 ||
+	   cmd_size != packet_size - COMMAND_LEN || cmd_size > payload_size ||
+	   cmd_addr < bin_info.load_address)
+		return;
+	offset = cmd_addr - bin_info.load_address;
+	if(offset >= bin_info.load_size || (offset % payload_size) != 0 ||
+	   cmd_size > bin_info.load_size - offset)
+		return;
+	expected = min(bin_info.load_size - offset, payload_size);
+	if(cmd_size != expected)
+		return;
+	index = offset / payload_size;
+	if(index >= BIN_INFO_MAP_SIZE)
+		return;
 
 	// Thanks to packet buffer alignment, command->data is guaranteed to be 8-byte aligned.
 	// If the destination address is 8-byte aligned, this will be a rocket.
@@ -194,22 +273,103 @@ void cmd_partbin(command_t * command)
 	// Ensure physical memory is actually written to from the cache, since we don't know how it might be used.
 	// Purge instead of writeback to avoid cache conflicts/trashing.
 
-	// Legacy check for versions < 2.0.0
-	if(__builtin_expect(payload1024, 0))
+	bin_info.map[index] = 1;
+}
+
+void cmd_cdfs_p7_part(command_t *command, unsigned int packet_size)
+{
+	cdfs_p7_part_command_t *part = (cdfs_p7_part_command_t *)command;
+	unsigned int txid, cmd_addr, cmd_size, data_size, offset, index;
+	unsigned int expected;
+
+	if(packet_size < sizeof(cdfs_p7_part_command_t))
+		return;
+	txid = ntohl(part->txid);
+	cmd_addr = ntohl(part->address);
+	cmd_size = ntohl(part->size);
+	data_size = packet_size - sizeof(cdfs_p7_part_command_t);
+	if(!cdfs_p7_bulk_active || txid != cdfs_p7_bulk_txid ||
+	   !cdfs_p7_matches(txid) || ntohl(part->reserved) != 0 ||
+	   cmd_size == 0 || cmd_size > 1440u || cmd_size != data_size ||
+	   cmd_addr < bin_info.load_address)
+		return;
+	offset = cmd_addr - bin_info.load_address;
+	if(offset >= bin_info.load_size || (offset % 1440u) != 0 ||
+	   cmd_size > bin_info.load_size - offset)
+		return;
+	expected = min(bin_info.load_size - offset, 1440u);
+	if(cmd_size != expected)
+		return;
+	index = offset / 1440u;
+	if(index >= BIN_INFO_MAP_SIZE)
+		return;
+
+	/* A valid tagged packet proves that the host received DC23. Extend the
+	 * bounded target wait before performing the copy. */
+	cdfs_p7_transfer_started();
+	SH4_aligned_memcpy((void *)cmd_addr, to_p1(part->data), cmd_size);
+	if(cached_dest)
+		CacheBlockPurge((void *)cmd_addr, (cmd_size + 31)/32 + 2);
+	bin_info.map[index] = 1;
+}
+
+void cmd_cdfs_p7_done(ip_header_t *ip, udp_header_t *udp,
+			      command_t *command, unsigned int packet_size)
+{
+	unsigned int txid, i, map_count;
+	unsigned int missing_address = 0;
+	unsigned int missing_size = 0;
+	unsigned char *buffer;
+	command_3int_t *response;
+
+	if(packet_size < COMMAND_LEN)
+		return;
+	txid = ntohl(command->address);
+	if(txid == 0 || txid != cdfs_p7_bulk_txid ||
+	   (!cdfs_p7_bulk_active && !cdfs_p7_bulk_complete) ||
+	   !cdfs_p7_matches(txid))
+		return;
+	cdfs_p7_transfer_started();
+
+	if(!cdfs_p7_bulk_complete)
 	{
-		index = (cmd_addr - bin_info.load_address) / 1024; // /1024 = >> 10
-	}
-	else
-	{
-		index = (cmd_addr - bin_info.load_address) / 1440; // /1440 = 64-bit multiplication trick
+		map_count = (bin_info.load_size + 1439u) / 1440u;
+		for(i = 0; i < map_count; i++)
+			if(!bin_info.map[i])
+				break;
+		if(i == map_count)
+		{
+			cdfs_p7_bulk_active = 0;
+			cdfs_p7_bulk_complete = 1;
+		}
+		else
+		{
+			missing_address = bin_info.load_address + i * 1440u;
+			missing_size = min(bin_info.load_size - i * 1440u, 1440u);
+		}
 	}
 
-	bin_info.map[index] = 1;
+	buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
+	response = (command_3int_t *)buffer;
+	memcpy(response->id, CMD_CDFSBULKDONE_P7, 4);
+	response->value0 = htonl(txid);
+	response->value1 = htonl(missing_address);
+	response->value2 = htonl(missing_size);
+	make_ip(ntohl(ip->src), ntohl(ip->dest),
+		UDP_H_LEN + sizeof(command_3int_t), IP_UDP_PROTOCOL,
+		(ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
+	make_udp(ntohs(udp->src), ntohs(udp->dest), sizeof(command_3int_t),
+		(ip_header_t *)(pkt_buf + ETHER_H_LEN),
+		(udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
+	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN +
+	       sizeof(command_3int_t));
 }
 
 void cmd_donebin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
 	unsigned int i;
+	if(cdfs_p7_active())
+		return;
 	unsigned char *buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
 	command_t * response = (command_t *)buffer;
 	memcpy(response, command, COMMAND_LEN);
@@ -353,6 +513,7 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	// (and they all expect a packet payload size of 1024 for TX/RX; this version command
 	// was added when packet sizes switched to 1440 bytes of payload data)
 	tool_version = ntohl(command->address);	// This global variable is used in the major/minor/patch version macros.
+	tool_features = ntohl(command->size);
 
 	// Legacy check for >= 2.0.0
 	if(DCTOOL_MAJOR >= 2)
@@ -393,6 +554,10 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
 	if(running)
 	{
+		/* A legacy RETV carries no transaction identity. It may complete an
+		 * ordinary syscall, but it must never escape a P7 CDFS wait. */
+		if(cdfs_p7_active())
+			return;
 		bb->stop(); // Disable packet RX
 
 		unsigned char *buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
@@ -407,6 +572,43 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		syscall_data = command->data;
 		escape_loop = 1;
 	}
+}
+
+void cmd_cdfs_p7_complete(ip_header_t *ip, udp_header_t *udp,
+				  command_t *command)
+{
+	unsigned int txid;
+	int status;
+	unsigned char *buffer;
+	command_t *response;
+
+	if(!running)
+		return;
+	txid = ntohl(command->address);
+	status = (int)ntohl(command->size);
+	/* A success completion is only authoritative after the tagged DC27 map
+	 * verified every chunk for this active transaction. Failure may terminate
+	 * an incomplete transfer. Duplicate success completions from the previous
+	 * finished transaction remain ACKable after its bulk state is retired. */
+	if(status == 0 && cdfs_p7_matches(txid) &&
+	   !cmd_cdfs_p7_bulk_ready(txid))
+		return;
+	if(!cdfs_p7_complete(txid, status))
+		return;
+
+	/* ACK both the first matching completion and a duplicate whose previous
+	 * ACK was lost. cdfs_p7_complete only releases the active matching wait. */
+	buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
+	response = (command_t *)buffer;
+	memcpy(response->id, CMD_CDFSACK_P7, 4);
+	response->address = htonl(txid);
+	response->size = htonl(status);
+	make_ip(ntohl(ip->src), ntohl(ip->dest), UDP_H_LEN + COMMAND_LEN,
+		IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
+	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN,
+		(ip_header_t *)(pkt_buf + ETHER_H_LEN),
+		(udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
+	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
 }
 
 void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command)

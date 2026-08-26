@@ -46,6 +46,7 @@
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
 #define CMD_WRITE_PUSH "DC22" // fire-and-forget console write: data inline, no SENDBIN pull, no CMD_RETVAL ACK
+#define CMD_CDFSREAD_P7 "DC23" /* tagged CDFS request: txid, sector, destination, bytes */
 
 extern unsigned short dcload_syscall_port;
 
@@ -58,6 +59,14 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 	unsigned int value1;
 	unsigned int value2;
 } command_3int_t;
+
+typedef struct __attribute__ ((packed, aligned(4))) {
+	unsigned char id[4];
+	unsigned int value0;
+	unsigned int value1;
+	unsigned int value2;
+	unsigned int value3;
+} command_4int_t;
 
 typedef struct __attribute__ ((packed, aligned(4))) {
 	unsigned char id[4];

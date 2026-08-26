@@ -125,8 +125,12 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 {
 	ip_udp_pseudo_header_t *pseudo;
 	unsigned short i;
+	unsigned short udp_length = ntohs(udp->length);
 	// Note that UDP's length field actually includes the UDP header, which is UDP_H_LEN
-	unsigned short udp_data_length = ntohs(udp->length) - UDP_H_LEN;
+	unsigned short udp_data_length;
+	if(udp_length < UDP_H_LEN)
+		return;
+	udp_data_length = udp_length - UDP_H_LEN;
 
 	pseudo = (ip_udp_pseudo_header_t *)to_p1(pseudo_array); // global small pseudo header array
 	pseudo->src_ip = ip->src;
@@ -153,6 +157,8 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		/*    scif_puts("UDP CHECKSUM BAD\n"); */
 		return;
 	}
+	if(udp_data_length == 0)
+		return;
 
 	// Handle receipt of DHCP packets that are directed to this system
 	dhcp_pkt_t *udp_pkt_data = (dhcp_pkt_t*)udp->data;
@@ -167,6 +173,8 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 	}
 	else
 	{
+		if(udp_data_length < 4)
+			return;
 		command_t *command = (command_t *)udp->data;
 
 		// Only one of these will ever match at a time. What we can do is set this variable to 0 after compare succeeds.
@@ -178,11 +186,20 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		// All command structs are now aligned on a 4-byte boundary thanks to the shift-by-2 trick
 		unsigned int pkt_match_id = *(unsigned int*)command->id;
 
+		/* P7 runtime CDFS bulk packets are tagged and length-checked before
+		 * touching RAM. Keep them separate from the legacy executable-upload
+		 * LBIN/PBIN/DBIN protocol. */
+		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_CDFSPART_P7, 4/4)))
+		{
+			cmd_cdfs_p7_part(command, udp_data_length);
+			pkt_match_id = 0;
+		}
+
 		// This one is the most likely to be called the most often, so put it first and tell GCC it's likely to be called
 		if (__builtin_expect((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_PARTBIN, 4/4)), 1))
 		{
 			// Handle legacy packets and v2.0.0+ packets <= 1460 bytes
-			cmd_partbin(command);
+			cmd_partbin(command, udp_data_length);
 			pkt_match_id = 0;
 		}
 
@@ -206,7 +223,21 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_DONEBIN, 4/4)))
 		{
-			cmd_donebin(ip, udp, command);
+			if(udp_data_length >= COMMAND_LEN)
+				cmd_donebin(ip, udp, command);
+			pkt_match_id = 0;
+		}
+
+		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_CDFSBULKDONE_P7, 4/4)))
+		{
+			cmd_cdfs_p7_done(ip, udp, command, udp_data_length);
+			pkt_match_id = 0;
+		}
+
+		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_CDFSDONE_P7, 4/4)))
+		{
+			if(udp_data_length >= COMMAND_LEN)
+				cmd_cdfs_p7_complete(ip, udp, command);
 			pkt_match_id = 0;
 		}
 
@@ -218,7 +249,8 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_LOADBIN, 4/4)))
 		{
-			cmd_loadbin(ip, udp, command);
+			if(udp_data_length >= COMMAND_LEN)
+				cmd_loadbin(ip, udp, command);
 			pkt_match_id = 0;
 		}
 

@@ -26,7 +26,10 @@ void set_mappath(char *path);
 
 int dc_fstat(unsigned char *buffer);
 int dc_write(unsigned char * buffer);
-int dc_write_push(unsigned char * buffer);
+int dc_write_push(unsigned char *buffer, int packet_size);
+int dc_console_sink_init(void);
+void dc_console_sink_shutdown(void);
+void dc_console_sink_notice(const char *message);
 int dc_read(unsigned char * buffer);
 int dc_open(unsigned char * buffer);
 int dc_close(unsigned char * buffer);
@@ -45,7 +48,11 @@ int dc_readdir(unsigned char * buffer);
 int dc_closedir(unsigned char * buffer);
 int dc_rewinddir(unsigned char * buffer);
 
-int dc_cdfs_redir_read_sectors(int isofd, unsigned char * buffer);
+int dc_cdfs_redir_read_sectors(int isofd, unsigned char *buffer,
+                               int packet_size);
+int dc_cdfs_p7_read_sectors(int isofd, unsigned char *buffer, int packet_size);
+void dc_cdfs_p7_ack(unsigned char *buffer, int packet_size);
+void dc_cdfs_p7_poll(void);
 
 int dc_gdbpacket(unsigned char * buffer);
 
@@ -73,6 +80,7 @@ int dc_gdbpacket(unsigned char * buffer);
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
 #define CMD_WRITE_PUSH "DC22" // fire-and-forget console write: data inline, no SENDBIN pull, no CMD_RETVAL ACK
+#define CMD_CDFSREAD_P7 "DC23" /* tagged CDFS request: txid, sector, destination, bytes */
 
 // Special definition for exception handler data
 #define CMD_EXCEPTION "EXPT"
@@ -116,6 +124,14 @@ struct _command_3int_string_t {
 } __attribute__ ((__packed__));
 
 typedef struct _command_3int_t command_3int_t;
+struct _command_4int_t {
+	unsigned char id[4];
+	unsigned int value0;
+	unsigned int value1;
+	unsigned int value2;
+	unsigned int value3;
+} __attribute__ ((__packed__));
+typedef struct _command_4int_t command_4int_t;
 typedef struct _command_2int_string_t command_2int_string_t;
 typedef struct _command_int_t command_int_t;
 typedef struct _command_int_string_t command_int_string_t;

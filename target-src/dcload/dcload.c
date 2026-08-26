@@ -42,8 +42,9 @@
 // The "P<n>" suffix marks our fork's loader patch level; on-screen confirmation of
 // which burned boot CD actually booted. ALWAYS bump it when target-src changes.
 // P5: fire-and-forget console push. P6: cdfs redirection repaired for modern KOS
-// (positive command handles, DMA-read command 17, real drive status).
-#define NAME "dcload-ip " DCLOAD_VERSION " - P6"
+// (positive command handles, DMA-read command 17, real drive status). P7:
+// feature-negotiated tagged CDFS completion, idempotence and bounded retry.
+#define NAME "dcload-ip " DCLOAD_VERSION " - P7"
 
 // Scale up the onscreen refresh interval
 #define ONSCREEN_REFRESH_SCALED ((unsigned long long int)ONSCREEN_DHCP_LEASE_TIME_REFRESH_INTERVAL * (unsigned long long int)PERFCOUNTER_SCALE)

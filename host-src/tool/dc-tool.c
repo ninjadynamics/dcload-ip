@@ -78,14 +78,21 @@ int _nl_msg_cat_cntr;
 #define DCTOOL_LOCAL_PORT        53534
 #define DCTOOL_LOCAL_PORT_LEGACY 53533
 
-// A running game's dcload only accepts NIC packets during the brief window it
-// polls inside a syscall (one per game printf), so a single fire-and-forget
-// reboot is easily missed. Send a short burst to cover several poll windows and
-// to ride out UDP loss. Total span (REBOOT_RETRIES * REBOOT_RETRY_USEC) must stay
+// A running program's resident dcload accepts NIC packets only while a syscall
+// poll is executing. The KOS-wide service makes those polls regular, but a
+// single fire-and-forget reboot can still be lost. Send a short burst to cover
+// the next poll and ordinary UDP loss. Total span
+// (REBOOT_RETRIES * REBOOT_RETRY_USEC) must stay
 // well under the post-reboot NIC re-init/link-negotiation gap (~1s of deafness),
 // so a DC that reboots mid-burst can't catch a later packet and reboot-loop.
 #define REBOOT_RETRIES   8
 #define REBOOT_RETRY_USEC 10000
+/* Reset is a one-shot control operation, so request/response is appropriate.
+ * A running KOS program services dcload through a low-rate background poll;
+ * allow several poll periods, retransmitting VERSION on ordinary UDP loss.
+ * The legacy port gets the same bounded chance for older loaders. */
+#define REBOOT_PROBE_ATTEMPT_USEC     250000
+#define REBOOT_HANDSHAKE_TIMEOUT_USEC 3000000
 
 /* KOS prints this immediately before its first redirected ISO9660 transaction.
  * If that request datagram disappears, the P6 target waits forever with IRQs
@@ -1349,6 +1356,32 @@ int send_command(char *command, unsigned int addr, unsigned int size, unsigned c
     return 0;
 }
 
+/* Synchronize reset with the target's polling service. VERSION is safe to
+ * retransmit and its reply proves that resident dcload code has actually run;
+ * unlike the ordinary prepare_comms() loop, this wait remains bounded. */
+static int probe_reset_service(unsigned char *buffer)
+{
+    unsigned int started = time_in_usec();
+
+    for(;;)
+    {
+	unsigned int elapsed = time_in_usec() - started;
+	unsigned int remaining;
+	unsigned int wait_usec;
+
+	if(elapsed >= REBOOT_HANDSHAKE_TIMEOUT_USEC)
+	    return 0;
+	remaining = REBOOT_HANDSHAKE_TIMEOUT_USEC - elapsed;
+	wait_usec = remaining < REBOOT_PROBE_ATTEMPT_USEC
+	          ? remaining : REBOOT_PROBE_ATTEMPT_USEC;
+	if(send_command(CMD_VERSION, encoded_tool_ver, DCTOOL_FEATURES,
+	                NULL, 0) < 0)
+	    return 0;
+	if(recv_matching(buffer, CMD_VERSION, wait_usec) >= 0)
+	    return 1;
+    }
+}
+
 unsigned int upload(char *filename, unsigned int address)
 {
     int inputfd;
@@ -2035,30 +2068,48 @@ int main(int argc, char *argv[])
     case 'r':
 	printf("Resetting...\n");
 	{
-	    /* The reset-only path skips the upload/download data flow, which is
-	       what normally runs prepare_comms() — the version handshake that
-	       assigns global_socket and discovers dcload's negotiated v2 port.
-	       Without it, send_command() sends on socket 0 (WSAENOTSOCK on
-	       Windows). Run the handshake here so standalone `-r` works, including
-	       against a running KOS game: its dcload console/file syscalls service
-	       the inbound RBOT via bb->loop(). */
-	    unsigned char comms_buffer[2048];
-	    if(prepare_comms(comms_buffer) < 0)
-	        goto doclean;
-	}
-	/* Burst the reboot so it lands in one of the running game's poll windows
-	   even if individual packets are missed/dropped (see REBOOT_RETRIES). */
-	{
+	    int handshake_ok = 0;
 	    int reboot_try;
+	    int reboot_sent = 0;
+	    unsigned char comms_buffer[2048];
+
+	    /* A KOS-wide service polls resident dcload independently of game output.
+	       Synchronize with it before RBOT so reset does not depend on a telemetry
+	       printf. Always advertise the real v2 feature set here: -l controls bulk
+	       payload size, not reset or the running program's console contract. */
+	    make_encoded_tool_version();
+	    global_socket = dcsocket;
+	    if(probe_reset_service(comms_buffer))
+	        handshake_ok = 1;
+	    if(!handshake_ok)
+	    {
+	        global_socket = dcsocket_legacy;
+	        if(probe_reset_service(comms_buffer))
+	            handshake_ok = 1;
+	    }
+	    if(!handshake_ok)
+	        printf("No dcload reset-service reply after 6 seconds; "
+	               "sending an unconfirmed reboot fallback.\n");
+
+	    /* Burst RBOT on both already-open sockets. This removes the old socket-0
+	       failure without making the VERSION reply a prerequisite, covers both
+	       the v2 and legacy destination ports, and still spans far less than the
+	       post-reboot link-negotiation gap. */
 	    for(reboot_try = 0; reboot_try < REBOOT_RETRIES; reboot_try++)
 	    {
 		unsigned int reboot_start;
-		if(send_command(CMD_REBOOT, 0, 0, NULL, 0) == -1)
-		    goto doclean;
+		global_socket = dcsocket;
+		if(send_command(CMD_REBOOT, 0, 0, NULL, 0) == 0)
+		    reboot_sent = 1;
+		global_socket = dcsocket_legacy;
+		if(send_command(CMD_REBOOT, 0, 0, NULL, 0) == 0)
+		    reboot_sent = 1;
 		reboot_start = time_in_usec();
 		while((time_in_usec() - reboot_start) < REBOOT_RETRY_USEC)
 		    ;
 	    }
+	    if(!reboot_sent)
+	        goto doclean;
 	}
 	break;
     default:

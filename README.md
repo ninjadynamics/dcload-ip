@@ -16,6 +16,7 @@ This **special version** has been updated/overhauled by **Moopthehedgehog** and 
 * DHCP support (use an IP address of 0.0.0.0 in `Makefile.cfg` to enable it)
 * NTSC 480i, PAL 576i, and VGA display output modes supported
 * Dumping exceptions over the network if the dcload console is enabled
+* Optional host-side decoding of framed binary telemetry (`--decode <module>`)
 
 ## Building
 
@@ -72,6 +73,22 @@ Edit `Makefile.cfg` for your system and network and then run `make`.
 3. `dc-tool -x exception-test` (generates an exception)
 4. `dc-tool -x gethostinfo` (displays the Dreamcast's ip, and the ip and port of
    the dc-tool host)
+
+## Optional Binary Telemetry Decoder
+
+`dc-tool-ip --decode <module> ...` loads an optional host-native decoder and
+passes it validated `DCTM` frames received as complete `DC22` console pushes.
+The module may be named explicitly (`decoder.dll` / `decoder.so`) or without an
+extension; the host probes the platform's practical suffixes. A missing or
+incompatible module is non-fatal. Valid telemetry is consumed silently when no
+decoder is loaded, while ordinary console text is unchanged.
+
+The versioned, allocation-free C ABI and byte-addressed little-endian envelope
+are defined in `host-src/tool/dctool-telemetry.h`. Decoder output returns through
+a synchronous callback into the existing bounded console sink; a module must
+not retain the frame, callback, context, or any pointed-to storage after its
+decode function returns. This is a PC-side extension only and requires no
+change to the burned Dreamcast loader.
 
 ## KOS GDB-over-dcload
 

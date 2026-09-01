@@ -45,6 +45,7 @@
 #include "dc-io.h"
 #include "dcload-types.h"
 #include "commands.h"
+#include "telemetry.h"
 
 #include "utils.h"
 
@@ -439,26 +440,46 @@ int dc_write(unsigned char * buffer)
  * the data out; never send CMD_RETVAL. A slow terminal here can only drop/queue packets, it can
  * never stall the DC. This is the UDP-philosophy console path; the blocking dc_write() above is
  * kept only for files and oversize writes. */
-int dc_write_push(unsigned char *buffer, int packet_size)
+int dc_write_push(unsigned char *buffer, int packet_size,
+                  const unsigned char **payload_out,
+                  unsigned int *payload_size_out)
 {
     command_3int_t *command = (command_3int_t *)buffer;
+    const unsigned char *payload;
     int fd;
+    unsigned int declared_count;
     unsigned int count;
     unsigned int available;
+
+    if(payload_out)
+        *payload_out = NULL;
+    if(payload_size_out)
+        *payload_size_out = 0;
 
     if(packet_size < (int)sizeof(command_3int_t))
         return 0;
     fd = (int)ntohl(command->value0);
     if(fd != 1 && fd != 2)
         return 0;
-    count = ntohl(command->value2);
+    declared_count = ntohl(command->value2);
     available = (unsigned int)packet_size - sizeof(command_3int_t);
-    if(count > available)
-        count = available;
+    payload = buffer + sizeof(command_3int_t);
+    count = declared_count > available ? available : declared_count;
+    if(payload_out)
+        *payload_out = payload;
+    if(payload_size_out)
+        *payload_size_out = count;
+    if(dctool_telemetry_filter(
+           fd, payload, declared_count, available,
+           dc_console_sink_write))
+        return 1;
     if(count > CONSOLE_PUSH_MAX)
         count = CONSOLE_PUSH_MAX;
-    /* value1 is unused for push; the data follows the command header inline */
-    dc_console_sink_write(fd, buffer + sizeof(command_3int_t), count);
+    /* value1 is unused for push; the data follows the command header inline.
+     * A valid DCTM frame is one complete binary telemetry record. It is either
+     * decoded by the optional host module or consumed silently, never dumped
+     * as terminal bytes. */
+    dc_console_sink_write(fd, payload, count);
     return 0;
 }
 

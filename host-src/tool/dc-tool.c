@@ -55,6 +55,7 @@
 #include "syscalls.h"
 #include "dc-io.h"
 #include "commands.h"
+#include "telemetry.h"
 
 #include "utils.h"
 
@@ -311,6 +312,9 @@ unsigned int nochroot = 0;
 void cleanup(char **fnames)
 {
     int counter = 0;
+
+    dc_console_sink_shutdown();
+    dctool_telemetry_decoder_unload();
 
     for(; counter < 4; counter++)
     {
@@ -1067,6 +1071,7 @@ void usage(void)
     printf("-i <isofile>   Enable cdfs redirection using iso image <isofile>\n");
     printf("-r             Reset (only works when dcload is in control)\n");
     printf("-o             Reattach console and fileserver to a running program (no upload, no reboot)\n");
+    printf("--decode <module>  Decode framed binary telemetry with an optional .dll/.so module\n");
     printf("-g             Start a GDB server\n");
     printf("-l             Force 1024-byte bulk-transfer payloads (dcload-ip v2+ only)\n");
     printf("-f             Disable FIFO delays for MUCH faster speeds (may increase packet loss)\n");
@@ -1278,7 +1283,7 @@ static int recv_matching(unsigned char *buffer, char *command, int timeout)
            !memcmp(((command_t *)buffer)->id, command, 4))
             return packet_size;
         if(!memcmp(((command_t *)buffer)->id, CMD_WRITE_PUSH, 4))
-            dc_write_push(buffer, packet_size);
+            dc_write_push(buffer, packet_size, NULL, NULL);
         elapsed = time_in_usec() - start;
     }
     while(elapsed < (unsigned int)timeout);
@@ -1307,7 +1312,7 @@ static int recv_matching_p7(unsigned char *buffer, const char *command,
             return packet_size;
         if(packet_size >= 4 &&
            !memcmp(((command_t *)buffer)->id, CMD_WRITE_PUSH, 4))
-            dc_write_push(buffer, packet_size);
+            dc_write_push(buffer, packet_size, NULL, NULL);
         else if(packet_size >= 4 &&
                 !memcmp(((command_t *)buffer)->id, CMD_CDFSACK_P7, 4))
             dc_cdfs_p7_ack(buffer, packet_size);
@@ -1657,22 +1662,19 @@ int do_console(char *path, char *isofile)
   if (!(memcmp(buffer, CMD_WRITE, 4)))
 	    CatchError(dc_write(buffer));
 	if (!(memcmp(buffer, CMD_WRITE_PUSH, 4))) {
-	    command_3int_t *push = (command_3int_t *)buffer;
+	    const unsigned char *payload = NULL;
 	    unsigned int count = 0;
-	    unsigned int available = packet_size > (int)sizeof(command_3int_t) ?
-		(unsigned int)packet_size - sizeof(command_3int_t) : 0;
+	    int telemetry;
 
-	    if(packet_size >= (int)sizeof(command_3int_t))
-		count = ntohl(push->value2);
-	    if(count > available)
-		count = available;
-	    if(count && cdfs_marker_feed(buffer + sizeof(command_3int_t), count))
+	    telemetry = dc_write_push(buffer, packet_size, &payload, &count);
+	    /* Binary telemetry shares DC22 transport but is not console text. Do
+	       not let arbitrary bit patterns enter the CDFS marker state machine. */
+	    if(!telemetry && count &&
+	       cdfs_marker_feed(payload, count))
 		cdfs_auto_retry_arm();
-	    else if(count && cdfs_auto_retry_armed &&
-		    cdfs_console_has_progress(buffer + sizeof(command_3int_t), count))
+	    else if(!telemetry && count && cdfs_auto_retry_armed &&
+		    cdfs_console_has_progress(payload, count))
 		cdfs_auto_retry_disarm();
-
-	    CatchError(dc_write_push(buffer, packet_size));
 	}
 	if (!(memcmp(buffer, CMD_READ, 4)))
 	    CatchError(dc_read(buffer));
@@ -1795,6 +1797,58 @@ int open_gdb_socket(int port)
 #define AVAILABLE_OPTIONS		"x:u:d:a:s:t:m:c:i:nlqhrgfo"
 #endif
 
+/* Preserve the historical short-option parser: remove the one long option in
+ * a single argv pass before getopt sees it. Both `--decode module` and
+ * `--decode=module` are accepted, in any position. */
+static int extract_decoder_option(int *argc, char **argv,
+                                  const char **decoder_path)
+{
+    int read_index;
+    int write_index = 1;
+
+    for(read_index = 1; read_index < *argc; ++read_index)
+    {
+        const char *arg = argv[read_index];
+        const char *path = NULL;
+
+        if(!strcmp(arg, "--decode"))
+        {
+            if(read_index + 1 >= *argc)
+            {
+                fprintf(stderr, "dc-tool: --decode requires a module path\n");
+                return -1;
+            }
+            path = argv[++read_index];
+        }
+        else if(!strncmp(arg, "--decode=", 9))
+        {
+            path = arg + 9;
+        }
+        if(path && !*path)
+        {
+            fprintf(stderr, "dc-tool: --decode requires a module path\n");
+            return -1;
+        }
+
+        if(path)
+        {
+            if(*decoder_path)
+            {
+                fprintf(stderr, "dc-tool: --decode may be specified only once\n");
+                return -1;
+            }
+            *decoder_path = path;
+        }
+        else
+        {
+            argv[write_index++] = argv[read_index];
+        }
+    }
+    argv[write_index] = NULL;
+    *argc = write_index;
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     unsigned int address = 0x0c010000;
@@ -1804,12 +1858,16 @@ int main(int argc, char *argv[])
     unsigned char command = 0;
     unsigned int cdfs_redir = 0;
     int someopt;
+    const char *decoder_path = NULL;
 
     /* Dynamically allocated, so it should be freed */
     char *filename = 0;
     char *isofile = 0;
     char *hostname = strdup(DREAMCAST_IP);
     char *cleanlist[4] = { 0, 0, 0, 0 };
+
+    if(extract_decoder_option(&argc, argv, &decoder_path) < 0)
+        return -1;
 
     if (argc < 2) {
 	usage();
@@ -1820,6 +1878,9 @@ int main(int argc, char *argv[])
 	if(start_ws())
 		return -1;
 #endif
+
+    if(decoder_path)
+        (void)dctool_telemetry_decoder_load(decoder_path);
 
 	someopt = getopt(argc, argv, AVAILABLE_OPTIONS);
     while (someopt > 0) {

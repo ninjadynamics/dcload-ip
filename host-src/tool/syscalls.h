@@ -26,7 +26,11 @@ void set_mappath(char *path);
 
 int dc_fstat(unsigned char *buffer);
 int dc_write(unsigned char * buffer);
-int dc_write_push(unsigned char *buffer, int packet_size);
+/* Returns 1 when a framed telemetry payload was consumed, otherwise 0. The
+ * optional outputs expose the already-parsed, length-clamped inline payload. */
+int dc_write_push(unsigned char *buffer, int packet_size,
+                  const unsigned char **payload_out,
+                  unsigned int *payload_size_out);
 int dc_console_sink_init(void);
 void dc_console_sink_shutdown(void);
 void dc_console_sink_notice(const char *message);

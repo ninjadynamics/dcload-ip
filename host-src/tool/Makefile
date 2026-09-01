@@ -40,6 +40,10 @@ endif
 ifdef MINGW32
   LDFLAGS	+= -lws2_32 -lwsock32 -liconv
   ZLIB_REQUIRED := 1
+else
+  ifneq ($(MACOS),1)
+    LDFLAGS	+= -ldl
+  endif
 endif
 
 # Add zlib to the command line end... if required
@@ -49,7 +53,7 @@ endif
 
 DCTOOL	= dc-tool-ip$(EXECUTABLEEXTENSION)
 
-OBJECTS	= dc-tool.o syscalls.o unlink.o utils.o shim.o
+OBJECTS	= dc-tool.o syscalls.o telemetry.o unlink.o utils.o shim.o
 
 .c.o:
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ -c $<

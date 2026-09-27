@@ -3,7 +3,8 @@
  *
  * Wire format: byte-identical to the "Network input (P4)" block of ps2link's
  * include/hostlink.h. Byte-addressed, little-endian, one datagram per state:
- *   0 magic "PKIN"   4 payload version   5 flags (bit 0: end of session)
+ *   0 magic "PKIN"   4 payload version   5 flags (bit 0: end of session,
+ *     bit 1: sync GO -- the host released a synchronized test start)
  *   6 size (u16, whole datagram, header .. PS2LINK_INPUT_WIRE_MAX)
  *   8 session (u32, nonzero)   12 sequence (u32, strictly increasing)
  *  16 payload, opaque to ps2link. Version 1 (host modules and the program):
@@ -32,6 +33,7 @@ extern "C" {
 #define PS2LINK_INPUT_HEADER_SIZE  16u
 #define PS2LINK_INPUT_WIRE_MAX     120u
 #define PS2LINK_INPUT_FLAG_END     0x01u
+#define PS2LINK_INPUT_FLAG_SYNC_GO 0x02u
 #define PS2LINK_INPUT_V1           1u
 #define PS2LINK_INPUT_V1_SIZE      26u
 

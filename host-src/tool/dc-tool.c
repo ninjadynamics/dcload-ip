@@ -1073,7 +1073,8 @@ void usage(void)
     printf("-r             Reset (only works when dcload is in control)\n");
     printf("-o             Reattach console and fileserver to a running program (no upload, no reboot)\n");
     printf("--decode <module>  Decode framed binary telemetry with an optional .dll/.so module\n");
-    printf("--input <module>   Stream controller input to the program (-x, -o; dcload P8).\n");
+    printf("--input <module>   Stream controller input to the program (-x, -o; dcload P8);\n");
+    printf("                   'none' streams with no module (control commands, e.g. go).\n");
     printf("                   Repeat to combine; a bare name loads input-<name>.so. While\n");
     printf("                   streaming, 127.0.0.1:18209 takes list/load/unload/reload.\n");
     printf("-g             Start a GDB server\n");

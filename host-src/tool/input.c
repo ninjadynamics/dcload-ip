@@ -28,6 +28,7 @@
  #define INPUT_MIN_GAP_MS   4
  #define INPUT_HEARTBEAT_MS 16
  #define INPUT_VALID_MS     250
+#define INPUT_GO_MS        500
 
  // Several modules drive the console together: buttons combine, each stick
  // axis takes the most deflected source and each trigger the strongest.
@@ -52,6 +53,8 @@
  static pthread_t input_thread_id, input_control_id;
  static volatile int input_running = 0;
  static int input_requested = 0;       // --input was given
+static volatile uint32_t input_go_until = 0;   // SYNC_GO on every datagram until then
+static volatile int input_go_now = 0;          // send the first GO datagram at once
  static int input_socket = -1;
  static int input_control_socket = -1;
  static uint32_t input_session = 0;
@@ -187,6 +190,9 @@
  int input_load_module(const char *name) {
   char msg[1200];
   input_requested = 1;
+  // "none": stream a released pad with no module, a carrier for control
+  // commands such as go (make multi-hw); modules can still be loaded later.
+  if (strcmp(name, "none") == 0) { fprintf(stderr, "input: streaming with no module\n"); return 0; }
   if (input_add(name, msg, sizeof(msg)) < 0) { fprintf(stderr, "input: %s.\n", msg); return -1; }
   fprintf(stderr, "input: %s\n", msg);
   return 0;
@@ -251,9 +257,11 @@
    input_poll_all(&state);
    const uint32_t now = input_now_ms();
    const uint32_t since = now - sent_ms;
-   if (!have_sent || since >= INPUT_HEARTBEAT_MS ||
+   const int go = (int32_t)(input_go_until - now) > 0;
+   if (!have_sent || since >= INPUT_HEARTBEAT_MS || input_go_now ||
        (since >= INPUT_MIN_GAP_MS && memcmp(&state, &sent, sizeof(state)) != 0)) {
-    input_send(&state, 0);
+    input_go_now = 0;
+    input_send(&state, go ? PS2LINK_INPUT_FLAG_SYNC_GO : 0);
     sent = state; sent_ms = now; have_sent = 1;
    }
 #ifdef _WIN32
@@ -266,7 +274,7 @@
  }
 
  // One command per datagram, one reply per command:
- //   list | load <name|path> | unload <name> | reload <name>
+ //   list | load <name|path> | unload <name> | reload <name> | go
  static void input_command(char *cmd, char *reply, size_t size) {
   char *arg = strchr(cmd, ' ');
   input_slot_t *slot;
@@ -292,8 +300,14 @@
     if (cmd[0] == 'u') { snprintf(reply, size, "unloaded %s", arg); }
     else { input_add(path, reply, size); }   // the rebuilt file at the same path
    }
+  } else if (strcmp(cmd, "go") == 0) {
+   // Synchronized start: SYNC_GO rides every datagram for GO_MS (a lost one
+   // costs nothing); the next datagram leaves at once.
+   input_go_until = input_now_ms() + INPUT_GO_MS;
+   input_go_now = 1;
+   snprintf(reply, size, "go");
   } else {
-   snprintf(reply, size, "error: commands are list, load <module>, unload <module>, reload <module>");
+   snprintf(reply, size, "error: commands are list, load <module>, unload <module>, reload <module>, go");
   }
   pthread_mutex_unlock(&input_lock);
   fprintf(stderr, "input: control: %s%s", reply, reply[0] && reply[strlen(reply) - 1] == '\n' ? "" : "\n");
@@ -343,7 +357,19 @@
    input_control_socket = -1;
    return;
   }
-  fprintf(stderr, "input: control on 127.0.0.1:%d (list, load, unload, reload).\n", port);
+#ifdef _WIN32
+  // A reply to a sender that has already gone (a timed-out script) raises an
+  // ICMP port unreachable, which Windows reports as WSAECONNRESET on this
+  // socket's next receive. Commands must never depend on that history.
+  {
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+   BOOL off = FALSE; DWORD bytes = 0;
+   WSAIoctl(input_control_socket, SIO_UDP_CONNRESET, &off, sizeof(off), NULL, 0, &bytes, NULL, NULL);
+  }
+#endif
+  fprintf(stderr, "input: control on 127.0.0.1:%d (list, load, unload, reload, go).\n", port);
  }
 
  int input_start(const char *hostname) {

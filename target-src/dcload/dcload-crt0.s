@@ -181,7 +181,7 @@ _dcloadsyscall:
 	mov	r6,r5
 	mov	r7,r6
 
-	mov	#22,r1 ! There are 22 syscalls
+	mov	#23,r1 ! Highest syscall number (23: P8 input_poll)
 	cmp/hs	r0,r1 ! Check r1 >= r0 ?
 	bf	badsyscall
 
@@ -247,3 +247,9 @@ gdbpacket_k:
 	.long _gdbpacket
 rewinddir_k:
 	.long _rewinddir
+! 22 stays invalid: earlier loaders accepted it past the end of this table.
+! 23 is outside their bound, so a program probing input_poll on them gets -1.
+reserved22_k:
+	.long badsyscall
+inputpoll_k:
+	.long _input_poll

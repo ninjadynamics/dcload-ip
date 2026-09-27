@@ -56,6 +56,7 @@
 #include "dc-io.h"
 #include "commands.h"
 #include "telemetry.h"
+#include "input.h"
 
 #include "utils.h"
 
@@ -1072,6 +1073,9 @@ void usage(void)
     printf("-r             Reset (only works when dcload is in control)\n");
     printf("-o             Reattach console and fileserver to a running program (no upload, no reboot)\n");
     printf("--decode <module>  Decode framed binary telemetry with an optional .dll/.so module\n");
+    printf("--input <module>   Stream controller input to the program (-x, -o; dcload P8).\n");
+    printf("                   Repeat to combine; a bare name loads input-<name>.so. While\n");
+    printf("                   streaming, 127.0.0.1:18209 takes list/load/unload/reload.\n");
     printf("-g             Start a GDB server\n");
     printf("-l             Force 1024-byte bulk-transfer payloads (dcload-ip v2+ only)\n");
     printf("-f             Disable FIFO delays for MUCH faster speeds (may increase packet loss)\n");
@@ -1849,6 +1853,47 @@ static int extract_decoder_option(int *argc, char **argv,
     return 0;
 }
 
+/* --input may repeat and appears in any position, like --decode. A module
+ * that is missing or incompatible is an error: control was requested. */
+static int extract_input_options(int *argc, char **argv)
+{
+    int read_index;
+    int write_index = 1;
+
+    for(read_index = 1; read_index < *argc; ++read_index)
+    {
+        const char *arg = argv[read_index];
+        const char *name = NULL;
+
+        if(!strcmp(arg, "--input"))
+        {
+            if(read_index + 1 >= *argc)
+            {
+                fprintf(stderr, "dc-tool: --input requires a module\n");
+                return -1;
+            }
+            name = argv[++read_index];
+        }
+        else if(!strncmp(arg, "--input=", 8))
+        {
+            name = arg + 8;
+        }
+
+        if(name)
+        {
+            if(!*name || input_load_module(name) < 0)
+                return -1;
+        }
+        else
+        {
+            argv[write_index++] = argv[read_index];
+        }
+    }
+    argv[write_index] = NULL;
+    *argc = write_index;
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     unsigned int address = 0x0c010000;
@@ -1867,6 +1912,8 @@ int main(int argc, char *argv[])
     char *cleanlist[4] = { 0, 0, 0, 0 };
 
     if(extract_decoder_option(&argc, argv, &decoder_path) < 0)
+        return -1;
+    if(extract_input_options(&argc, argv) < 0)
         return -1;
 
     if (argc < 2) {
@@ -2077,6 +2124,10 @@ int main(int argc, char *argv[])
     printf("Executing at <0x%x>\n", address);
   }
 
+	/* The stream starts before execution: dcload keeps only the newest
+	   state until the program polls it (dcload P8 syscall 23). */
+	if(input_start(hostname) < 0)
+	    goto doclean;
 	if(execute(address, console, cdfs_redir))
 	    goto doclean;
 	if (console)
@@ -2124,6 +2175,8 @@ int main(int argc, char *argv[])
 	   worst costing one failed probe retry). */
 	send_command(CMD_RETVAL, 0, 0, NULL, 0);
 	printf("Reattached, serving console%s\n", isofile ? " + cdfs redirection" : "");
+	if(input_start(hostname) < 0)
+	    goto doclean;
 	do_console(path, isofile);
 	break;
     case 'r':
@@ -2178,11 +2231,13 @@ int main(int argc, char *argv[])
 	break;
     }
 
+    input_stop();
     cleanup(cleanlist);
     return 0;
 
 /* Failed (I hate gotos...) */
 doclean:
+    input_stop();
     cleanup(cleanlist);
     return -1;
 }

@@ -47,6 +47,7 @@ static volatile unsigned char rtl_is_copying = 0;
 
 static void rtl_reset(void);
 static void rtl_init(void);
+static void rtl_init_hw(int restart_phy);
 static void pktcpy(unsigned char *dest, unsigned char *src, unsigned int n);
 static int rtl_bb_rx(void);
 
@@ -105,6 +106,15 @@ static void rtl_reset(void)
 }
 
 static void rtl_init(void)
+{
+	rtl_init_hw(1);
+}
+
+/* restart_phy = 0 re-initializes only the MAC (chip reset, buffers, filters).
+ * The chip soft reset leaves the PHY and its link alone, so an Rx overflow
+ * recovered this way costs microseconds; restarting auto-negotiation would
+ * drop the link and stall the next syscall for about a second. */
+static void rtl_init_hw(int restart_phy)
 {
 	unsigned int tmp;
 
@@ -360,7 +370,8 @@ static void rtl_init(void)
 	nic8[RT_CHIPCMD] = RT_CMD_RX_ENABLE | RT_CMD_TX_ENABLE;
 
 	/* Enable auto-negotiation and restart that process */
-	nic16[RT_MII_BMCR/2] |= 0x9200;
+	if (restart_phy)
+		nic16[RT_MII_BMCR/2] |= 0x9200;
 
 	/* Initialize status vars */
 	rtl.cur_tx = 0;
@@ -819,8 +830,14 @@ void rtl_bb_loop(int is_main_loop)
 			rtl_bb_rx();
 		}
 
-		/* link change */
-		if (__builtin_expect(intr & RT_INT_RXFIFO_UNDERRUN, 0))
+		/* link change. A running program must never wait on the PHY: record
+		 * the link state and carry on (the status bit was acknowledged above).
+		 * Only dcload's own loops wait for the link to come back. */
+		if (__builtin_expect(intr & RT_INT_RXFIFO_UNDERRUN, 0) && running)
+		{
+			rtl_link_up = (nic16[RT_MII_BMSR/2] & 0x20) ? 1 : 0;
+		}
+		else if (__builtin_expect(intr & RT_INT_RXFIFO_UNDERRUN, 0))
 		{
 
 			if (booted && (!running))
@@ -885,7 +902,9 @@ void rtl_bb_loop(int is_main_loop)
 			nic16[RT_INTRSTATUS/2] = 0xffff;
 	*/
 			// NetBSD, FreeBSD, and OpenBSD all just do a full re-init if this happens.
-			rtl_init();
+			// Re-init the MAC only: the link is fine, and restarting auto-negotiation
+			// here froze a running program for about a second (see rtl_init_hw).
+			rtl_init_hw(0);
 		}
 
 		if(is_main_loop && rtl_link_up && (!rtl_is_copying)) // Only want this to run in main loop

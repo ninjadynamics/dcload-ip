@@ -6,7 +6,7 @@ INCLUDE	= -I../../target-inc
 
 OBJCOPY	= $(TARGETOBJCOPY)
 
-DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o video.o memcpy.o memcmp.o memfuncs.o packet.o net.o adapter.o rtl8139.o lan_adapter.o dhcp.o dcload.o perfctr.o cdfs_redir.o cdfs_syscalls.o syscalls.o maple.o commands.o
+DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o video.o memcpy.o memcmp.o memfuncs.o packet.o net.o adapter.o rtl8139.o lan_adapter.o dhcp.o dcload.o perfctr.o cdfs_redir.o cdfs_syscalls.o syscalls.o maple.o commands.o netinput.o
 EXCOBJECTS	= exception.o
 
 %.o : %.c

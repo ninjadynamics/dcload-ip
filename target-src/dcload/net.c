@@ -6,6 +6,7 @@
 #include "net.h"
 #include "dhcp.h"
 #include "memfuncs.h"
+#include "netinput.h"
 
 static void process_broadcast(unsigned char *pkt);
 static void process_icmp(ether_header_t *ether, ip_header_t *ip, icmp_header_t *icmp);
@@ -20,13 +21,33 @@ __attribute__((aligned(32))) unsigned char raw_pkt_buf[RAW_TX_PKT_BUF_SIZE]; // 
 // The performance gains are well worth the 2 wasted bytes.
 __attribute__((aligned(2))) unsigned char * pkt_buf = &(raw_pkt_buf[2]);
 
+/* The one broadcast IPv4 datagram meant for us: a DHCP server's reply (OFFER/ACK)
+ * to the client port, which a server may send to the broadcast address. */
+static int broadcast_is_dhcp_reply(unsigned char *pkt)
+{
+	ip_header_t *ip = (ip_header_t *)(pkt + ETHER_H_LEN);
+	udp_header_t *udp;
+
+	if (ip->protocol != IP_UDP_PROTOCOL)
+		return 0;
+	udp = (udp_header_t *)(pkt + ETHER_H_LEN + 4*(ip->version_ihl & 0x0f));
+	return ntohs(udp->dest) == 68; /* DHCP client port */
+}
+
 static void process_broadcast(unsigned char *pkt) // arp request
 {
 	ether_header_t *ether_header = (ether_header_t *)pkt;
 	arp_header_t *arp_header = (arp_header_t *)(pkt + ETHER_H_LEN);
 
+	/* P8: every other broadcast IPv4 datagram on the LAN is someone else's (a PS2's
+	 * udptty console goes to 255.255.255.255:18194). P7 ran them all through the
+	 * command matcher, inside a running program's syscalls. */
 	if (ether_header->type[1] == 0x00)
-		process_mine(pkt);
+	{
+		if (broadcast_is_dhcp_reply(pkt))
+			process_mine(pkt);
+		return;
+	}
 
 	if (ether_header->type[1] != 0x06) /* ARP */
 		return;
@@ -200,6 +221,13 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		{
 			// Handle legacy packets and v2.0.0+ packets <= 1460 bytes
 			cmd_partbin(command, udp_data_length);
+			pkt_match_id = 0;
+		}
+
+		/* P8 network input: no reply, header-checked before touching memory. */
+		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_INPUT, 4/4)))
+		{
+			cmd_input(ip, (const unsigned char *)udp->data, udp_data_length);
 			pkt_match_id = 0;
 		}
 

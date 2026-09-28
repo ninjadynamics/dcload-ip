@@ -46,7 +46,9 @@
 // feature-negotiated tagged CDFS completion, idempotence and bounded retry.
 // P8: MAC-only Rx-overflow recovery, link changes never stall a running
 // program, and network controller input (PKIN datagrams, syscall 23).
-#define NAME "dcload-ip " DCLOAD_VERSION " - P8"
+// P9: ingress parsing bounded by the received length (IP IHL/total, UDP
+// length), and broadcast DHCP replies routed to DHCP handling only.
+#define NAME "dcload-ip " DCLOAD_VERSION " - P9"
 
 // Scale up the onscreen refresh interval
 #define ONSCREEN_REFRESH_SCALED ((unsigned long long int)ONSCREEN_DHCP_LEASE_TIME_REFRESH_INTERVAL * (unsigned long long int)PERFCOUNTER_SCALE)

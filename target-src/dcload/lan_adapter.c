@@ -571,7 +571,7 @@ static int la_bb_rx(void)
 
 		/* Submit it for processing */
 		//process_pkt(current_pkt);
-		process_pkt(copyback_current_pkt);
+		process_pkt(copyback_current_pkt, len);
 
 // For stats
 //		total_pkts_rx++;

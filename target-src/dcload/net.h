@@ -22,8 +22,9 @@
 // ICMP Protocol Identifier
 #define IP_ICMP_PROTOCOL 1
 
-// This is the only function that needs to be exported
-void process_pkt(unsigned char *pkt);
+// This is the only function that needs to be exported. len is the number of
+// frame bytes the NIC actually received at pkt (P9: parsing is bounded by it).
+void process_pkt(unsigned char *pkt, unsigned int len);
 
 extern const unsigned char broadcast[6]; // Used in DHCP code
 

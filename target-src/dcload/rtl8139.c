@@ -724,7 +724,7 @@ static int rtl_bb_rx()
 #endif
 
 			//process_pkt(current_pkt);
-			process_pkt(to_p1(current_pkt));
+			process_pkt(to_p1(current_pkt), pkt_size);
 
 // Process time end
 #ifdef PKT_PROCESS_TIMING

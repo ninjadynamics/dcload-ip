@@ -8,10 +8,11 @@
 #include "memfuncs.h"
 #include "netinput.h"
 
-static void process_broadcast(unsigned char *pkt);
+static void process_broadcast(unsigned char *pkt, unsigned int len);
 static void process_icmp(ether_header_t *ether, ip_header_t *ip, icmp_header_t *icmp);
-static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *udp);
-static void process_mine(unsigned char *pkt);
+static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *udp,
+			unsigned int ip_payload_length, int broadcast_dhcp_only);
+static void process_mine(unsigned char *pkt, unsigned int len, int broadcast_dhcp_only);
 
 const unsigned char broadcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
@@ -21,35 +22,26 @@ __attribute__((aligned(32))) unsigned char raw_pkt_buf[RAW_TX_PKT_BUF_SIZE]; // 
 // The performance gains are well worth the 2 wasted bytes.
 __attribute__((aligned(2))) unsigned char * pkt_buf = &(raw_pkt_buf[2]);
 
-/* The one broadcast IPv4 datagram meant for us: a DHCP server's reply (OFFER/ACK)
- * to the client port, which a server may send to the broadcast address. */
-static int broadcast_is_dhcp_reply(unsigned char *pkt)
-{
-	ip_header_t *ip = (ip_header_t *)(pkt + ETHER_H_LEN);
-	udp_header_t *udp;
-
-	if (ip->protocol != IP_UDP_PROTOCOL)
-		return 0;
-	udp = (udp_header_t *)(pkt + ETHER_H_LEN + 4*(ip->version_ihl & 0x0f));
-	return ntohs(udp->dest) == 68; /* DHCP client port */
-}
-
-static void process_broadcast(unsigned char *pkt) // arp request
+static void process_broadcast(unsigned char *pkt, unsigned int len) // arp request
 {
 	ether_header_t *ether_header = (ether_header_t *)pkt;
 	arp_header_t *arp_header = (arp_header_t *)(pkt + ETHER_H_LEN);
 
 	/* P8: every other broadcast IPv4 datagram on the LAN is someone else's (a PS2's
 	 * udptty console goes to 255.255.255.255:18194). P7 ran them all through the
-	 * command matcher, inside a running program's syscalls. */
+	 * command matcher, inside a running program's syscalls. P9: the one broadcast
+	 * datagram meant for us, a DHCP server's reply (OFFER/ACK) to the client port,
+	 * reaches DHCP handling only, never the loader command matcher. */
 	if (ether_header->type[1] == 0x00)
 	{
-		if (broadcast_is_dhcp_reply(pkt))
-			process_mine(pkt);
+		process_mine(pkt, len, 1);
 		return;
 	}
 
 	if (ether_header->type[1] != 0x06) /* ARP */
+		return;
+
+	if (len < ETHER_H_LEN + ARP_H_LEN)
 		return;
 
 	/* hardware address space = ethernet */
@@ -142,14 +134,22 @@ static void process_icmp(ether_header_t *ether, ip_header_t *ip, icmp_header_t *
 	}
 }
 
-static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *udp)
+static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *udp,
+			unsigned int ip_payload_length, int broadcast_dhcp_only)
 {
 	ip_udp_pseudo_header_t *pseudo;
 	unsigned short i;
-	unsigned short udp_length = ntohs(udp->length);
+	unsigned short udp_length;
 	// Note that UDP's length field actually includes the UDP header, which is UDP_H_LEN
 	unsigned short udp_data_length;
-	if(udp_length < UDP_H_LEN)
+	// P9: the declared UDP length must fit the IP payload, which process_mine
+	// already bounded by the bytes actually received.
+	if(ip_payload_length < UDP_H_LEN)
+		return;
+	udp_length = ntohs(udp->length);
+	if(udp_length < UDP_H_LEN || udp_length > ip_payload_length)
+		return;
+	if(broadcast_dhcp_only && ntohs(udp->dest) != 68) /* DHCP client port */
 		return;
 	udp_data_length = udp_length - UDP_H_LEN;
 
@@ -185,6 +185,9 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 	dhcp_pkt_t *udp_pkt_data = (dhcp_pkt_t*)udp->data;
 	if(__builtin_expect(udp_pkt_data->op == DHCP_OP_BOOTREPLY, 0)) // DHCP ACK or DHCP OFFER
 	{
+		// Fixed BOOTP header plus the magic cookie the option parsers skip
+		if(udp_data_length < DHCP_H_LEN + 4)
+			return;
 		if(!handle_dhcp_reply(ether->src, udp_pkt_data, udp_data_length)) // -8 because udp->length includes 8-byte udp header
 		{ // -1 is true in C
 			// If we got a DHCP packet that belongs to some other machine, e.g. some machine requires a broadcasted address instead of a unicasted one,
@@ -194,7 +197,7 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 	}
 	else
 	{
-		if(udp_data_length < 4)
+		if(broadcast_dhcp_only || udp_data_length < 4)
 			return;
 		command_t *command = (command_t *)udp->data;
 
@@ -314,7 +317,7 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 	}
 }
 
-static void process_mine(unsigned char *pkt)
+static void process_mine(unsigned char *pkt, unsigned int len, int broadcast_dhcp_only)
 {
 	ether_header_t *ether_header = (ether_header_t *)pkt;
 	ip_header_t *ip_header = (ip_header_t *)(pkt + ETHER_H_LEN);
@@ -327,17 +330,26 @@ static void process_mine(unsigned char *pkt)
 		// We can respond to those.
 		if(ether_header->type[1] == 0x06)
 		{
-			process_broadcast(pkt);
+			process_broadcast(pkt, len);
 		}
 		return;
 	}
+
+	/* P9: the IPv4 header and its declared total length must fit the bytes the
+	 * NIC actually received, before any checksum or dispatch reads them. */
+	if(__builtin_expect(len < ETHER_H_LEN + IP_H_LEN, 0))
+		return;
+
+	unsigned char ip_ihl = ip_header->version_ihl & 0x0f;
+	unsigned short ip_length = ntohs(ip_header->length);
+	if(__builtin_expect((ip_header->version_ihl >> 4) != 4 || ip_ihl < 5 ||
+			    ip_length < 4*ip_ihl || ip_length > len - ETHER_H_LEN, 0))
+		return;
 
 	/* ignore fragmented packets */
 
 	if(__builtin_expect(ip_header->flags_frag_offset & 0xff3f, 0))
 		return;
-
-	unsigned char ip_ihl = ip_header->version_ihl & 0x0f;
 
 	/* check ip header checksum */
 	unsigned short i = ip_header->checksum;
@@ -350,33 +362,36 @@ static void process_mine(unsigned char *pkt)
 	{
 		/* udp */
 		udp_header = (udp_header_t *)(pkt + ETHER_H_LEN + 4*ip_ihl);
-		process_udp(ether_header, ip_header, udp_header);
+		process_udp(ether_header, ip_header, udp_header, ip_length - 4*ip_ihl,
+			    broadcast_dhcp_only);
 	}
 	else if(__builtin_expect(ip_header->protocol == IP_ICMP_PROTOCOL, 0))
 	{
 		/* icmp */
+		if(broadcast_dhcp_only || ip_length - 4*ip_ihl < ICMP_H_LEN)
+			return;
 		icmp_header = (icmp_header_t *)(pkt + ETHER_H_LEN + 4*ip_ihl);
 		process_icmp(ether_header, ip_header, icmp_header);
 	}
 }
 
-void process_pkt(unsigned char *pkt)
+void process_pkt(unsigned char *pkt, unsigned int len)
 {
 	ether_header_t *ether_header = (ether_header_t *)pkt;
 
-	if (ether_header->type[0] != 0x08)
+	if (len < ETHER_H_LEN || ether_header->type[0] != 0x08)
 		return;
 
 	// Destination ethernet header is the first thing in the packet, so it's always aligned to 2 bytes
 	if (!memcmp_16bit_eq(ether_header->dest, bb->mac, 6/2))
 	{
-		process_mine(pkt);
+		process_mine(pkt, len, 0);
 		return;
 	}
 
 	if (!memcmp_16bit_eq(ether_header->dest, broadcast, 6/2))
 	{
-		process_broadcast(pkt);
+		process_broadcast(pkt, len);
 		return;
 	}
 }

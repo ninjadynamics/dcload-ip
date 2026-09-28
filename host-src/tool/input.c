@@ -51,10 +51,12 @@
  static input_slot_t input_slots[INPUT_MAX_MODULES];
  static pthread_mutex_t input_lock = PTHREAD_MUTEX_INITIALIZER;
  static pthread_t input_thread_id, input_control_id;
- static volatile int input_running = 0;
+ // input_lock guards running and the go request as well as the slots.
+ static int input_running = 0;
  static int input_requested = 0;       // --input was given
-static volatile uint32_t input_go_until = 0;   // SYNC_GO on every datagram until then
-static volatile int input_go_now = 0;          // send the first GO datagram at once
+ static int input_go_armed = 0;        // a go deadline is pending
+ static uint32_t input_go_until = 0;   // SYNC_GO on every datagram until then
+ static int input_go_now = 0;          // send the first GO datagram at once
  static int input_socket = -1;
  static int input_control_socket = -1;
  static uint32_t input_session = 0;
@@ -250,17 +252,40 @@ static volatile int input_go_now = 0;          // send the first GO datagram at 
   pthread_mutex_unlock(&input_lock);
  }
 
+ static int input_is_running(void) {
+  int running;
+  pthread_mutex_lock(&input_lock);
+  running = input_running;
+  pthread_mutex_unlock(&input_lock);
+  return running;
+ }
+
+ // Samples the go request as one coherent state. Only an armed deadline sends
+ // GO; an expired one is disarmed, so the modular delta is only ever taken
+ // for a short future deadline. The immediate-send request is consumed here,
+ // in the same critical section, so a go arriving meanwhile is never lost.
+ static int input_go_sample(uint32_t now, int *send_now) {
+  int go;
+  pthread_mutex_lock(&input_lock);
+  if (input_go_armed && (int32_t)(input_go_until - now) <= 0) { input_go_armed = 0; }
+  go = input_go_armed;
+  *send_now = input_go_now;
+  input_go_now = 0;
+  pthread_mutex_unlock(&input_lock);
+  return go;
+ }
+
  static void *input_thread(void *arg) { ps2_input_state_t state, sent; uint32_t sent_ms = 0; int have_sent = 0;
   (void)arg;
 
-  while (input_running) {
+  while (input_is_running()) {
+   int go_now;
    input_poll_all(&state);
    const uint32_t now = input_now_ms();
    const uint32_t since = now - sent_ms;
-   const int go = (int32_t)(input_go_until - now) > 0;
-   if (!have_sent || since >= INPUT_HEARTBEAT_MS || input_go_now ||
+   const int go = input_go_sample(now, &go_now);
+   if (!have_sent || since >= INPUT_HEARTBEAT_MS || go_now ||
        (since >= INPUT_MIN_GAP_MS && memcmp(&state, &sent, sizeof(state)) != 0)) {
-    input_go_now = 0;
     input_send(&state, go ? PS2LINK_INPUT_FLAG_SYNC_GO : 0);
     sent = state; sent_ms = now; have_sent = 1;
    }
@@ -304,6 +329,7 @@ static volatile int input_go_now = 0;          // send the first GO datagram at 
    // Synchronized start: SYNC_GO rides every datagram for GO_MS (a lost one
    // costs nothing); the next datagram leaves at once.
    input_go_until = input_now_ms() + INPUT_GO_MS;
+   input_go_armed = 1;
    input_go_now = 1;
    snprintf(reply, size, "go");
   } else {
@@ -315,7 +341,7 @@ static volatile int input_go_now = 0;          // send the first GO datagram at 
 
  static void *input_control_thread(void *arg) {
   (void)arg;
-  while (input_running) {
+  while (input_is_running()) {
    fd_set fds; struct timeval tv;
    struct sockaddr_in from;
 #ifdef _WIN32
@@ -379,20 +405,41 @@ static volatile int input_go_now = 0;          // send the first GO datagram at 
   // A new session supersedes any earlier client's stream on the console.
   input_session = (uint32_t)time(NULL) ^ ((uint32_t)getpid() << 16);
   if (input_session == 0) { input_session = 1; }
+  pthread_mutex_lock(&input_lock);
   input_running = 1;
+  pthread_mutex_unlock(&input_lock);
 #ifdef _WIN32
   // The default ~15.6 ms scheduler tick would stretch every 1 ms poll.
   timeBeginPeriod(1);
 #endif
-  pthread_create(&input_thread_id, NULL, input_thread, NULL);
+  if (pthread_create(&input_thread_id, NULL, input_thread, NULL) != 0) {
+   fprintf(stderr, "input: could not start the input thread.\n");
+   pthread_mutex_lock(&input_lock);
+   input_running = 0;
+   pthread_mutex_unlock(&input_lock);
+#ifdef _WIN32
+   timeEndPeriod(1);
+#endif
+   input_socket_close(input_socket);
+   input_socket = -1;
+   return -1;
+  }
   input_control_open();
-  if (input_control_socket >= 0) { pthread_create(&input_control_id, NULL, input_control_thread, NULL); }
+  if (input_control_socket >= 0 && pthread_create(&input_control_id, NULL, input_control_thread, NULL) != 0) {
+   fprintf(stderr, "input: could not start the control thread; modules are fixed for this session.\n");
+   input_socket_close(input_control_socket);
+   input_control_socket = -1;
+  }
   return 0;
  }
 
+ // Only the main thread starts and stops the threads.
  void input_stop(void) { ps2_input_state_t released; int i;
-  if (!input_running) { return; }
+  pthread_mutex_lock(&input_lock);
+  const int running = input_running;
   input_running = 0;
+  pthread_mutex_unlock(&input_lock);
+  if (!running) { return; }
   pthread_join(input_thread_id, NULL);
   if (input_control_socket >= 0) { pthread_join(input_control_id, NULL); input_socket_close(input_control_socket); input_control_socket = -1; }
 #ifdef _WIN32
